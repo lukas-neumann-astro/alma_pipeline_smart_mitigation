@@ -55,7 +55,81 @@ worth resolving before this governs real imaging runs):
 
 import math
 from dataclasses import dataclass
+from typing import Callable
 import pandas as pd
+
+
+# =============================================================================
+# Size calculation (ported from CheckProductSizeHeuristics.calculate_sizes)
+# =============================================================================
+
+def calculate_sizes(imlist: list[dict], get_nchan: Callable[[str], int],
+                    full_pol: bool = False):
+    """Same logic as CheckProductSizeHeuristics.calculate_sizes() in
+    checkproductsize.py; the only change is that the two lookups it did
+    through the pipeline context are passed in instead:
+
+        get_nchan(spw)  replaces
+            ref_ms.get_spectral_window(
+                context.observing_run.virtual2real_spw_id(int(spw), ref_ms)
+            ).num_channels
+        full_pol        replaces
+            'INTERFEROMETRY_FULL_POL_CUBE_IMAGING' in context.processing_intents
+
+    Inside the pipeline, just keep calling self.calculate_sizes(imlist);
+    this port exists so the planner and its examples can run standalone.
+
+    imlist: one dict per imaging target with keys
+        field, spw, imsize=(nx, ny), nbin (-1 means 1), specmode.
+    Returns (cubesizes, max_cubesize, productsizes, total_productsize):
+        cubesizes[spw]    -- max cube size over all targets using that spw
+        productsizes[spw] -- product size of the LAST target using that spw
+                             (CAS-11363: assumes all targets of a spw are
+                             ~the same size)
+        total_productsize -- sum of productsize over EVERY target
+    All sizes in GB."""
+    cubesizes = {}
+    productsizes = {}
+    total_productsize = 0.0
+    for target in imlist:
+        nx, ny = target["imsize"]
+        nbin = target["nbin"] if target["nbin"] != -1 else 1
+
+        if target["specmode"] == "cube":
+            nchan = get_nchan(target["spw"])
+            cubesize = 4.0 * nx * ny * nchan / nbin / 1e9
+        else:  # 'cont'
+            cubesize = 0.0
+
+        # Should include nterms, though overall size is dominated by cube
+        # mode, which is currently always nterms=1 (as in the original).
+        mfssize = 4.0 * nx * ny / 1e9
+
+        if full_pol:  # original I plus IQUV products
+            cubesize = 5 * cubesize
+            mfssize = 5 * mfssize
+
+        if cubesizes.get(target["spw"]) is not None:
+            cubesizes[target["spw"]] = max(cubesizes[target["spw"]], cubesize)
+        else:
+            cubesizes[target["spw"]] = cubesize
+        productsize = 2.0 * (mfssize + cubesize)
+        productsizes[target["spw"]] = productsize
+        total_productsize += productsize
+
+    return cubesizes, max(cubesizes.values()), productsizes, total_productsize
+
+
+def field_product_sizes(imlist: list[dict], get_nchan: Callable[[str], int],
+                        full_pol: bool = False) -> dict:
+    """Per-field total product size (sum over that field's spws), computed
+    with calculate_sizes() on each field's targets. This is the
+    fields_product_sizes input of plan()/step2_field_reduction()."""
+    out = {}
+    for field in dict.fromkeys(t["field"] for t in imlist):
+        targets = [t for t in imlist if t["field"] == field]
+        out[field] = calculate_sizes(targets, get_nchan, full_pol)[3]
+    return out
 
 
 # =============================================================================
@@ -621,8 +695,19 @@ if __name__ == "__main__":
     print()
 
     limits = Limits(maxcubesize=40.0, maxproductsize=150.0, maxcubelimit=60.0)
-    cube_sizes = {"16 (repr.)": 100.0, "18": 25.0, "20": 55.0, "22": 45.0}
-    product_sizes = {"16 (repr.)": 180.0, "18": 45.0, "20": 99.0, "22": 81.0}
+
+    # Sizes come from calculate_sizes() on an imlist (in the real pipeline
+    # this is makeimlist's target list; here: one field, one target per spw).
+    example_imlist = [
+        {"field": "f1", "spw": "16 (repr.)", "imsize": (2550, 2550), "nbin": -1, "specmode": "cube"},
+        {"field": "f1", "spw": "18",         "imsize": (2200, 2200), "nbin": -1, "specmode": "cube"},
+        {"field": "f1", "spw": "20",         "imsize": (1340, 1340), "nbin": -1, "specmode": "cube"},
+        {"field": "f1", "spw": "22",         "imsize": (2420, 2420), "nbin": -1, "specmode": "cube"},
+    ]
+    nchan_by_spw = {r["spw"]: r["nchan"] for r in example_spws}
+    cube_sizes, max_cube, product_sizes, total_product = calculate_sizes(
+        example_imlist, nchan_by_spw.__getitem__)
+    print(f"calculate_sizes: max cube {max_cube:.1f} GB, total product {total_product:.1f} GB")
 
     selected, msg = plan(table, limits, cube_sizes, product_sizes,
                           repr_spw="16 (repr.)", nfields=1,
