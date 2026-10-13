@@ -3,27 +3,47 @@ Score-based size mitigation for the ALMA pipeline's checkproductsize.py.
 
 Instead of the original try -> recompute -> test cascade (nbin, then FoV,
 then cell size, then fields, then spws), the mitigation is worked out in
-ONE pass from a table of what each lever could achieve:
+ONE pass from a table of what each lever could achieve, and the result is
+rated with a single QUALITY SCORE between 0 and 1:
 
-  1. POTENTIAL   Every lever's possible size reduction is computed up front
-                 (mitigation_nbin/pb/cell/roi/fields) and collected in one
-                 table, one row per spw, one column per lever.
-  2. SCORES      A lever's score is its mitigation value (higher = better).
-                 For the aggregate product budget, the per-lever score is
-                 the product-size-weighted mean over the spws (lever_scores).
-  3. SOLVE       Levers are picked in score order, only as many as needed:
-                   - per spw, the cube levers (n_bin, PB, cell, ROI) needed
-                     to reach maxcubesize;
-                   - then, if the summed product size is still above
-                     maxproductsize, the levers are walked down the global
-                     score ranking (nfields included) until the budget fits.
-  4. SELECT      Only if mitigation alone cannot meet the limits, spws are
-                 dropped (representative spw always kept), gated by
-                 maxcubelimit and maxproductsize.
+    1    no mitigation was necessary
+    0    the limits cannot be met, even with every mitigation applied
+    else the more (and the more drastic) mitigation was needed, the lower
 
-The result is a single table (plan()) with one row per spw: the lever
-values, which levers were applied, the achieved reduction, the mitigated
-cube/product sizes and whether the spw is kept.
+Every lever returns its own score, and the final score is their product.
+The levers, from most to least moderate (see the score_* functions):
+
+    n_bin, PB, cell   reduce the data quality but remove nothing: 0.9 for
+                      n_bin; between 0.9 and 1.0 for PB and cell, the less
+                      they change the original values, the closer to 1
+    ROI               0.5 to 1.0: 1 if the ROI is the whole spw, down to 0.5
+                      when almost everything is cut away
+    removing spws     0.4 to 0.6, lower the more spws are removed (the
+                      representative spw is always kept)
+    removing fields   0.2 to 0.4, lower the more fields are removed (the
+                      representative field is always kept)
+
+How the plan is chosen (enumerate_plans() / plan()):
+
+  1. POTENTIAL   The table holds, per spw, what each lever could remove.
+  2. ENUMERATE   Every plan is listed: which cube levers (n_bin, PB, cell,
+                 ROI) are applied to each kept spw -- at least enough to
+                 bring its cube under the cube target -- which spws are kept
+                 (the representative one always is) and how many fields are
+                 kept (the representative one always is). For each plan the
+                 mitigated sizes, the lever scores and the final score are
+                 computed.
+  3. SELECT      Plans that break a limit (maxcubelimit, the oversize cap,
+                 maxproductsize) are infeasible and score 0. The feasible
+                 plan with the highest score is the result; ties go to the
+                 plan with fewer levers, then the smaller product size.
+  The full, sorted list can be returned for diagnostics
+  (plan(..., return_candidates=True) -> msg['candidates']).
+
+The result of plan() is a single table with one row per spw (lever values,
+levers applied, achieved reduction, mitigated sizes, kept or not, the spw's
+own lever score) plus msg['scores'], the score of every lever and the final
+score.
 
 Limits:
 
@@ -32,7 +52,7 @@ Limits:
                     and spw selection enforces it as a hard budget.
   maxcubelimit   -> per-spw hard gate in the selection: a non-representative
                     spw over this limit is excluded; the representative spw
-                    over this limit is an unrecoverable failure.
+                    over this limit is an unrecoverable failure (score 0).
 
 nfields is a single, MOUS-wide count (all spws are imaged across the same
 fields). It is a PRODUCT-size lever only: dropping fields shrinks the total
@@ -46,14 +66,18 @@ KNOWN SIMPLIFICATIONS (worth resolving before this governs real imaging runs):
     code's empirical exp() formula, and the original's carry-over of the
     converged PB value between steps (PB_mitigation = max(PB_mitigation,
     PB_limit)) is not modelled: only WHICH levers are used per spw is
-    tracked, not the parameter value each lever converges to.
+    tracked, not the parameter value each lever converges to. PB, cell and
+    ROI are always applied in full (down to the floor / the given ROI).
   - Levers are assumed to compound independently (1 - prod(1 - r_i)); n_bin
     and ROI both act on the spectral axis, so this may not hold.
   - The reduction of the cube-level levers is applied equally to the product
     size and the cube size (the product size also contains the MFS term,
     which n_bin does not affect).
+  - The score of n_bin/PB/cell/ROI over the MOUS is the plain mean over the
+    kept spws of the per-spw scores (not weighted by size).
 """
 
+import itertools
 import math
 from dataclasses import dataclass
 from typing import Callable
@@ -215,10 +239,10 @@ def mitigation_fields(n_fields_total: int, n_fields_kept: int) -> float:
 
 
 def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
-    """Field-count analogue of minimum_steps_to_target(). Unlike the
-    per-spw levers, there is no menu of distinct levers to rank here --
-    mitigation_fields() is a single, deterministic, linear function of how
-    many fields are removed -- so the minimum count is solved directly:
+    """Fewest fields to remove for a required product reduction. There is
+    no menu of levers to choose from here -- mitigation_fields() is a
+    single, linear function of how many fields are removed -- so the count
+    is solved directly:
 
         k = ceil(required_reduction * n_fields_total)
 
@@ -229,6 +253,73 @@ def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
     max_removable = n_fields_total - 1
     k = min(math.ceil(required_reduction * n_fields_total), max_removable)
     return k, k / n_fields_total
+
+
+# =============================================================================
+# Quality scores: how much a mitigation hurts (1 = not at all, 0 = worst)
+# =============================================================================
+
+SCORE_NBIN = 0.9  # channel binning, when applied
+SCORE_MIN_PB_CELL = 0.9  # PB / cell at a mitigation of 100 % (never reached)
+SCORE_MIN_ROI = 0.5  # ROI that cuts away (almost) the whole spw
+SCORE_RANGE_SPWS = (0.4, 0.6)  # (worst, best): all other spws / one spw removed
+SCORE_RANGE_FIELDS = (0.2, 0.4)  # (worst, best): all other fields / one removed
+
+
+def score_nbin() -> float:
+    """Channel binning: a fixed 0.9 whenever it is applied."""
+    return SCORE_NBIN
+
+
+def score_pb(mitigation: float) -> float:
+    """PB (FoV) tightening: 0.9 to 1.0, the closer to 1 the less the FoV
+    changes. `mitigation` is the size reduction from mitigation_pb()."""
+    return 1.0 - (1.0 - SCORE_MIN_PB_CELL) * mitigation
+
+
+def score_cell(mitigation: float) -> float:
+    """Cell size (hm_cell) increase: 0.9 to 1.0, like score_pb()."""
+    return 1.0 - (1.0 - SCORE_MIN_PB_CELL) * mitigation
+
+
+def score_roi(mitigation: float) -> float:
+    """ROI: 1.0 for the whole spw (mitigation 0), falling linearly to 0.5
+    when everything is cut away (mitigation 1). `mitigation` is
+    mitigation_roi(), the removed fraction."""
+    return 1.0 - (1.0 - SCORE_MIN_ROI) * mitigation
+
+
+def _removal_score(n_total: int, n_removed: int, score_range: tuple) -> float:
+    worst, best = score_range
+    max_removable = n_total - 1  # the representative one always stays
+    if n_removed <= 0 or max_removable <= 0:
+        return 1.0
+    n_removed = min(n_removed, max_removable)
+    return best - (best - worst) * n_removed / max_removable
+
+
+def score_spws(n_total: int, n_removed: int) -> float:
+    """Removing spws: 1.0 if none; otherwise 0.6 (almost none removed)
+    falling linearly to 0.4 (all but the representative spw removed)."""
+    return _removal_score(n_total, n_removed, SCORE_RANGE_SPWS)
+
+
+def score_fields(n_total: int, n_removed: int) -> float:
+    """Removing fields: 1.0 if none; otherwise 0.4 (almost none removed)
+    falling linearly to 0.2 (all but the representative field removed)."""
+    return _removal_score(n_total, n_removed, SCORE_RANGE_FIELDS)
+
+
+def cube_lever_qualities(table: pd.DataFrame) -> pd.DataFrame:
+    """Score each cube lever WOULD have if applied to each spw (rows: spws,
+    columns: CUBE_LEVER_COLUMNS). Levers that cannot be applied (value 0)
+    get 1.0."""
+    q = pd.DataFrame(index=table.index)
+    q["n_bin"] = [SCORE_NBIN if m > 0 else 1.0 for m in table["n_bin"]]
+    q["PB"] = [score_pb(m) for m in table["PB"]]
+    q["cell"] = [score_cell(m) for m in table["cell"]]
+    q["ROI"] = [score_roi(m) for m in table["ROI"]]
+    return q
 
 
 # =============================================================================
@@ -259,44 +350,6 @@ def total_reduction(row: pd.Series, columns: list[str] = LEVER_COLUMNS) -> float
     return 1.0 - remaining
 
 
-def minimum_steps_to_target(lever_values: dict, required_reduction: float):
-    """Given one spw's per-lever mitigation values, rank levers by value
-    (higher = better) and apply them one at a time -- compounding, per
-    total_reduction()'s logic -- until the cumulative reduction meets
-    `required_reduction`. Returns (n_steps, achieved_reduction, levers_used)
-    with levers_used in the order applied.
-
-    This answers "what is the fewest levers we need to touch for this spw
-    to get it back under the limit", rather than always applying all four
-    regardless of whether that's necessary -- so a spw that's only
-    slightly over budget might resolve in 1 step, while a badly over-budget
-    one may need all 4 (or still fail to reach the target, in which case
-    all available levers were applied and the caller has to fall back to
-    dropping the spw).
-
-    If a spw isn't over budget at all, required_reduction should be passed
-    as 0 (or negative), which returns 0 steps immediately.
-    """
-    if required_reduction <= 0:
-        return 0, 0.0, []
-
-    ordered = sorted(lever_values.items(), key=lambda kv: kv[1], reverse=True)
-    remaining = 1.0
-    used = []
-    for lever, value in ordered:
-        if value <= 0:
-            break  # sorted descending, so no further lever helps
-        remaining *= 1.0 - value
-        used.append(lever)
-        achieved = 1.0 - remaining
-        if achieved >= required_reduction:
-            return len(used), achieved, used
-
-    # exhausted all effective levers without reaching the target --
-    # caller must fall back to spw filtering for this candidate
-    return len(used), 1.0 - remaining, used
-
-
 def _refresh_sizes(table: pd.DataFrame) -> pd.DataFrame:
     """Recomputes the mitigated sizes from the cube-lever reduction
     (achieved_reduction, hits cube AND product) and the field reduction
@@ -312,29 +365,24 @@ def _refresh_sizes(table: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-def add_size_and_step_columns(
+def add_size_columns(
     table: pd.DataFrame,
     cube_sizes: dict,
     product_sizes: dict,
     maxcubesize: float,
-    columns: list[str] = CUBE_LEVER_COLUMNS,
+    maxcubelimit: float = -1,
 ) -> pd.DataFrame:
     """Extends the lever table with, per spw:
         cube_size_GB, product_size_GB   -- baseline predicted sizes
-        required_reduction              -- 0 if already within maxcubesize,
-                                            else 1 - maxcubesize/cube_size
-        min_steps, levers_used          -- from minimum_steps_to_target()
-        achieved_reduction              -- cube-lever reduction actually
-                                            reached with those steps (>=
-                                            required_reduction unless even
-                                            all levers fall short)
-        field_reduction                 -- product-only reduction from
-                                            dropping fields (0 until applied)
+        required_reduction              -- 0 if already within the cube target
+                                            (the smaller of maxcubesize and
+                                            maxcubelimit, -1 = unused), else
+                                            1 - target/cube_size
+        min_steps, levers_used, achieved_reduction, field_reduction
+                                         -- nothing applied yet (0, '-', 0, 0);
+                                            filled in for the chosen plan
         mitigated_cube_GB, mitigated_product_GB
                                          -- see _refresh_sizes()
-
-    `columns` are the levers that may be used to reach maxcubesize. nfields
-    is deliberately not one of them (see the module docstring).
 
     NOTE: achieved_reduction is applied to product_size_GB as well as
     cube_size_GB, i.e. assuming the product size scales down by the same
@@ -344,23 +392,17 @@ def add_size_and_step_columns(
     table = table.copy()
     table["cube_size_GB"] = [cube_sizes[spw] for spw in table.index]
     table["product_size_GB"] = [product_sizes[spw] for spw in table.index]
-    if maxcubesize == -1:  # -1 = no limit (as in the pipeline inputs)
-        table["required_reduction"] = 0.0
-    else:
-        table["required_reduction"] = table.apply(
-            lambda r: max(0.0, 1.0 - maxcubesize / r["cube_size_GB"]), axis=1
+    targets = [x for x in (maxcubesize, maxcubelimit) if x != -1]  # -1 = no limit
+    if targets:
+        target = min(targets)
+        table["required_reduction"] = table["cube_size_GB"].map(
+            lambda size: max(0.0, 1.0 - target / size)
         )
-
-    steps, achieved, used = [], [], []
-    for spw, row in table.iterrows():
-        lever_values = {col: row[col] for col in columns}
-        n, ach, lv = minimum_steps_to_target(lever_values, row["required_reduction"])
-        steps.append(n)
-        achieved.append(ach)
-        used.append(",".join(lv) if lv else "-")
-    table["min_steps"] = steps
-    table["levers_used"] = used
-    table["achieved_reduction"] = achieved
+    else:
+        table["required_reduction"] = 0.0
+    table["min_steps"] = 0
+    table["levers_used"] = "-"
+    table["achieved_reduction"] = 0.0
     table["field_reduction"] = 0.0
     return _refresh_sizes(table)
 
@@ -402,8 +444,7 @@ def build_mitigation_table(
     mitigation_roi()'s docstring), so it is OFF by default. With
     use_roi=False, the ROI column is filled with 0.0 for every spw --
     i.e. present in the table for a consistent shape, but contributing
-    no reduction anywhere, so it is never picked by minimum_steps_to_target()
-    or step2_global_escalation() (both skip levers whose value is <= 0).
+    no reduction anywhere, so it is never applied (levers whose value is <= 0 are skipped).
     spw_rows entries don't need 'n_roi'/'n_total' keys at all when
     use_roi=False. Pass use_roi=True (and provide n_roi/n_total per spw)
     to switch it on once the real ROI parameter exists in the context.
@@ -415,12 +456,11 @@ def build_mitigation_table(
     that counts; passing it here only makes the raw table show the nfields
     column. See add_nfields_columns() for what the column holds.
 
-    'nfields' is part of LEVER_COLUMNS, so it takes part in the lever scoring
-    and in total_reduction (the POTENTIAL total over all levers). Unlike the
-    other levers it only shrinks the product total, never a single cube, so
-    the per-spw cube search ignores it (CUBE_LEVER_COLUMNS); plan() decides
-    how many fields to drop and writes the achieved value into the
-    'nfields' column.
+    'nfields' is part of LEVER_COLUMNS, so it takes part in total_reduction
+    (the POTENTIAL total over all levers). Unlike the other levers it only
+    shrinks the product total, never a single cube, so the per-spw cube
+    search ignores it (CUBE_LEVER_COLUMNS); plan() decides how many fields
+    to drop and writes the achieved value into the 'nfields' column.
     """
     records = []
     for row in spw_rows:
@@ -453,49 +493,171 @@ class Limits:
 
 
 # =============================================================================
-# Scores: how much each lever can deliver, for the aggregate product budget
+# Enumerating every plan
 # =============================================================================
 
 
-def lever_scores(
-    table: pd.DataFrame, product_sizes: dict, columns: list[str] = LEVER_COLUMNS
-) -> pd.Series:
-    """Score of each lever = its mitigation value averaged over the spws,
-    weighted by product size (a lever that is strong where the bytes are
-    scores higher). Higher is better. For nfields, which has the same
-    value in every row, the score is simply its mitigation value.
-
-    The scores are computed once, from the unmitigated table, and the
-    ranking they give is not recomputed along the way."""
-    weights = pd.Series({spw: product_sizes[spw] for spw in table.index})
-    weights = weights / weights.sum()
-    scores = {col: float((table[col] * weights).sum()) for col in columns}
-    return pd.Series(scores).sort_values(ascending=False)
+def _lever_subsets(available: list[str]):
+    for k in range(len(available) + 1):
+        yield from itertools.combinations(available, k)
 
 
-# =============================================================================
-# Solving: apply as few levers as needed, best-scoring first
-# =============================================================================
+def _spw_options(row: pd.Series, qualities: pd.Series, prune: bool) -> list[dict]:
+    """All sensible cube-lever combinations for one spw.
+
+    A combination is sensible if it brings the cube under the cube target
+    (required_reduction); if no combination can, only the one applying every
+    available lever is (the cube is then as small as it can get). With
+    prune=True, a combination is dropped when another one reduces at least
+    as much AND scores at least as well on every lever -- it can never be
+    part of a better plan, so this loses nothing but diagnostic rows."""
+    available = [lv for lv in CUBE_LEVER_COLUMNS if row[lv] > 0]
+    options = []
+    for subset in _lever_subsets(available):
+        remaining = 1.0
+        for lv in subset:
+            remaining *= 1.0 - row[lv]
+        options.append(
+            {
+                "levers": subset,
+                "reduction": 1.0 - remaining,
+                "q": tuple(
+                    qualities[lv] if lv in subset else 1.0 for lv in CUBE_LEVER_COLUMNS
+                ),
+            }
+        )
+    reaching = [
+        o for o in options if o["reduction"] >= row["required_reduction"] - 1e-12
+    ]
+    options = reaching or [max(options, key=lambda o: o["reduction"])]
+    if prune:
+        options = [
+            o
+            for i, o in enumerate(options)
+            if not any(
+                p["reduction"] >= o["reduction"]
+                and all(a >= b for a, b in zip(p["q"], o["q"]))
+                and (p["reduction"] > o["reduction"] or p["q"] != o["q"] or j < i)
+                for j, p in enumerate(options)
+                if j != i
+            )
+        ]
+    return options
 
 
-def _apply_cube_lever(table: pd.DataFrame, lever: str) -> pd.DataFrame:
-    """Applies one more cube-level lever to every spw that can still use it
-    (value > 0 and not applied yet), compounding it into achieved_reduction."""
+def enumerate_plans(
+    table: pd.DataFrame,
+    limits: Limits,
+    repr_spw: str,
+    nfields: int = 1,
+    prune: bool = True,
+    max_candidates: int = 1_000_000,
+) -> pd.DataFrame:
+    """Every plan -- a choice of cube levers per kept spw, of which spws to
+    keep (the representative one always is) and of how many fields to keep
+    (the representative field always is) -- with its sizes, its lever scores
+    and its final score. `table` must already hold the size columns
+    (add_size_columns()). One row per plan, best first.
+
+    Columns:
+      <one per spw>   cube levers applied to that spw ('dropped' if removed)
+      n_spws_kept, nfields_kept, n_levers
+      product_GB, max_cube_GB   summed product size / largest cube of the
+                                kept spws after mitigation
+      feasible        all limits met (cube limit, oversize cap, product budget)
+      n_bin, PB, cell, ROI, spws, fields   the lever scores
+      score           their product, or 0 if not feasible
+    Sorted by score (best first), then fewer levers, then smaller product.
+
+    prune: leave out cube-lever combinations that can never be part of a
+    better plan (see _spw_options); False lists literally every one.
+    The number of plans grows quickly with the number of spws, so more than
+    max_candidates raises an error."""
+    spws = [repr_spw] + [s for s in table.index if s != repr_spw]
+    qualities = cube_lever_qualities(table)
+    options = {s: _spw_options(table.loc[s], qualities.loc[s], prune) for s in spws}
+
+    n_plans = nfields * len(options[repr_spw])
+    for s in spws[1:]:
+        n_plans *= 1 + len(options[s])
+    if n_plans > max_candidates:
+        raise ValueError(
+            f"{n_plans} plans to enumerate (> max_candidates={max_candidates}); "
+            "raise max_candidates, or use prune=True"
+        )
+
+    limit = limits.maxcubelimit
+    budget = limits.maxproductsize
+    n_spw = len(spws)
+    rows = []
+    for mask in range(2 ** (n_spw - 1)):
+        kept = [spws[0]] + [s for i, s in enumerate(spws[1:]) if mask >> i & 1]
+        for combo in itertools.product(*(options[s] for s in kept)):
+            cubes = [
+                table.at[s, "cube_size_GB"] * (1 - o["reduction"])
+                for s, o in zip(kept, combo)
+            ]
+            product0 = sum(
+                table.at[s, "product_size_GB"] * (1 - o["reduction"])
+                for s, o in zip(kept, combo)
+            )
+            cube_ok = limit == -1 or (
+                cubes[0] <= limit + 1e-9
+                and all(c <= limit + 1e-9 for c in cubes[1:])
+                and sum(c > 0.5 * limit for c in cubes[1:]) <= 1
+            )
+            lever_scores = [
+                sum(o["q"][i] for o in combo) / len(kept)
+                for i in range(len(CUBE_LEVER_COLUMNS))
+            ]
+            spw_score = score_spws(n_spw, n_spw - len(kept))
+            levers = {s: ",".join(o["levers"]) or "-" for s, o in zip(kept, combo)}
+            n_levers = sum(len(o["levers"]) for o in combo)
+            for n_kept in range(1, nfields + 1):
+                product = product0 * n_kept / nfields
+                feasible = cube_ok and (budget == -1 or product <= budget + 1e-9)
+                field_score = score_fields(nfields, nfields - n_kept)
+                score = math.prod(lever_scores) * spw_score * field_score
+                rows.append(
+                    [levers.get(s, "dropped") for s in spws]
+                    + [len(kept), n_kept, n_levers, product, max(cubes), feasible]
+                    + lever_scores
+                    + [spw_score, field_score, score if feasible else 0.0]
+                )
+    columns = (
+        list(spws)
+        + ["n_spws_kept", "nfields_kept", "n_levers", "product_GB", "max_cube_GB"]
+        + ["feasible"]
+        + CUBE_LEVER_COLUMNS
+        + ["spws", "fields", "score"]
+    )
+    plans = pd.DataFrame(rows, columns=columns)
+    return plans.sort_values(
+        ["score", "n_levers", "product_GB"], ascending=[False, True, True]
+    ).reset_index(drop=True)
+
+
+def _apply_plan(table: pd.DataFrame, best: pd.Series, spws: list[str], nfields: int):
+    """The per-spw result table for the chosen plan: levers applied to the
+    kept spws, fields removed, mitigated sizes, and the 'kept' column."""
     table = table.copy()
-    for idx, row in table.iterrows():
-        used = (
-            set(row["levers_used"].split(",")) if row["levers_used"] != "-" else set()
-        )
-        if lever in used or row[lever] <= 0:
+    for spw in spws:
+        used = best[spw]
+        if used == "dropped":
             continue
-        table.at[idx, "achieved_reduction"] = 1 - (1 - row["achieved_reduction"]) * (
-            1 - row[lever]
-        )
-        table.at[idx, "levers_used"] = (
-            lever if row["levers_used"] == "-" else row["levers_used"] + "," + lever
-        )
-        table.at[idx, "min_steps"] = row["min_steps"] + 1
-    return _refresh_sizes(table)
+        levers = [] if used == "-" else used.split(",")
+        remaining = 1.0
+        for lever in levers:
+            remaining *= 1.0 - table.at[spw, lever]
+        table.at[spw, "achieved_reduction"] = 1.0 - remaining
+        table.at[spw, "levers_used"] = used
+        table.at[spw, "min_steps"] = len(levers)
+    table["kept"] = [best[spw] != "dropped" for spw in table.index]
+    table = _refresh_sizes(table)
+    n_removed = nfields - int(best["nfields_kept"])
+    if n_removed > 0:
+        table = _apply_fields(table, nfields, n_removed)
+    return table
 
 
 def _apply_fields(table: pd.DataFrame, n_fields: int, n_removed: int) -> pd.DataFrame:
@@ -515,127 +677,29 @@ def _apply_fields(table: pd.DataFrame, n_fields: int, n_removed: int) -> pd.Data
     return _refresh_sizes(table)
 
 
-def mitigate(
-    table: pd.DataFrame,
-    limits: Limits,
-    cube_sizes: dict,
-    product_sizes: dict,
-    nfields: int = 1,
-):
-    """Works out the mitigation in one pass. Returns (table, scores).
-
-    1. Per spw, the fewest cube levers (best value first) that bring the
-       cube under limits.maxcubesize.
-    2. If the summed product size is still above limits.maxproductsize, the
-       levers are taken in global score order (lever_scores) until it fits.
-       nfields takes part in that ranking like any other lever; when it is
-       reached, only as many fields are dropped as the budget requires
-       (the representative field always stays). Cube levers are applied to
-       every spw that can still use them.
-
-    Nothing is dropped here -- see select_spws() for that."""
-    table = add_nfields_columns(table, nfields)
-    scores = lever_scores(table, product_sizes)
-    table = add_size_and_step_columns(
-        table, cube_sizes, product_sizes, limits.maxcubesize
+def _failure_message(table: pd.DataFrame, limits: Limits, repr_spw: str) -> dict:
+    """Why no plan is feasible: the representative spw's cube cannot be
+    brought under maxcubelimit, or the product budget cannot be met."""
+    cube_floor = table.at[repr_spw, "cube_size_GB"] * (
+        1 - total_reduction(table.loc[repr_spw], CUBE_LEVER_COLUMNS)
     )
-
-    if limits.maxproductsize != -1:
-        for lever, score in scores.items():
-            total = table["mitigated_product_GB"].sum()
-            if total <= limits.maxproductsize or score <= 0:
-                break
-            if lever == "nfields":
-                required = 1.0 - limits.maxproductsize / total
-                n_removed, _ = minimum_fields_to_remove(nfields, required)
-                if n_removed > 0:
-                    table = _apply_fields(table, nfields, n_removed)
-            else:
-                table = _apply_cube_lever(table, lever)
-    return table, scores
-
-
-# =============================================================================
-# Selection: the only place where a spw can be dropped. Gated by maxcubelimit
-# (hard) and maxproductsize (budget), on the mitigated sizes.
-# =============================================================================
-
-
-def select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
-    repr_row = table.loc[repr_spw]
-    if (
-        limits.maxcubelimit != -1
-        and repr_row["mitigated_cube_GB"] > limits.maxcubelimit
-    ):
-        return None, {
+    if limits.maxcubelimit != -1 and cube_floor > limits.maxcubelimit:
+        return {
             "longmsg": "Cube size could not be mitigated. The representative spw's "
-            "cube size (%.2f GB) is larger than maxcubelimit (%.2f GB)."
-            % (repr_row["mitigated_cube_GB"], limits.maxcubelimit),
+            "smallest possible cube size (%.2f GB) is larger than maxcubelimit "
+            "(%.2f GB)." % (cube_floor, limits.maxcubelimit),
             "shortmsg": "Cube size could not be mitigated",
+            "failure": "cube",
         }
-
-    admissible = table[
-        (table.index == repr_spw)
-        | (limits.maxcubelimit == -1)
-        | (table["mitigated_cube_GB"] <= limits.maxcubelimit)
-    ].copy()
-
-    max_size = admissible["mitigated_product_GB"].max()
-    admissible["score"] = max_size / (admissible["mitigated_product_GB"] + 1e-6)
-    admissible = admissible.sort_values("score", ascending=False)
-    # representative always first, regardless of score
-    admissible = pd.concat([admissible.loc[[repr_spw]], admissible.drop(repr_spw)])
-
-    # oversize cap: at most one non-representative spw above 0.5*maxcubelimit
-    kept_rows, oversize_used = [], False
-    for spw, row in admissible.iterrows():
-        is_oversize = (
-            limits.maxcubelimit != -1
-            and spw != repr_spw
-            and row["mitigated_cube_GB"] > 0.5 * limits.maxcubelimit
-        )
-        if is_oversize:
-            if oversize_used:
-                continue
-            oversize_used = True
-        kept_rows.append(spw)
-    admissible = admissible.loc[kept_rows]
-
-    # greedy budget selection (descending score == ascending size, so the
-    # break below is a valid knapsack short-circuit)
-    selected, used = [], 0.0
-    for spw, row in admissible.iterrows():
-        if spw == repr_spw:
-            selected.append(spw)
-            used += row["mitigated_product_GB"]
-            continue
-        if (
-            limits.maxproductsize == -1
-            or used + row["mitigated_product_GB"] <= limits.maxproductsize
-        ):
-            selected.append(spw)
-            used += row["mitigated_product_GB"]
-        else:
-            break
-
-    if limits.maxproductsize != -1 and used > limits.maxproductsize:
-        return None, {
-            "longmsg": "Product size could not be mitigated. Remaining factor: %.4f."
-            % (used / limits.maxproductsize),
-            "shortmsg": "Product size could not be mitigated",
-        }
-
-    return table.loc[selected], {
-        "longmsg": (
-            "Size was mitigated"
-            if any(table["min_steps"] > 0)
-            else "No size mitigation needed"
-        ),
-        "shortmsg": (
-            "Size was mitigated"
-            if any(table["min_steps"] > 0)
-            else "No size mitigation"
-        ),
+    smallest = (
+        1 - total_reduction(table.loc[repr_spw], CUBE_LEVER_COLUMNS)
+    ) / table.at[repr_spw, "nfields_total"]
+    product_floor = table.at[repr_spw, "product_size_GB"] * smallest
+    return {
+        "longmsg": "Product size could not be mitigated. Remaining factor: %.4f."
+        % (product_floor / limits.maxproductsize),
+        "shortmsg": "Product size could not be mitigated",
+        "failure": "product",
     }
 
 
@@ -673,6 +737,8 @@ def plan(
     repr_spw: str,
     full_pol: bool = False,
     nfields: int | None = None,
+    return_candidates: bool = False,
+    prune: bool = True,
 ):
     """Returns (final_table, msg).
 
@@ -688,17 +754,27 @@ def plan(
       full_pol   True for full-pol cube imaging (sizes x5).
       nfields    number of fields, ONE value for all spws. Default: the
                  number of distinct fields in imlist.
+      return_candidates
+                 also return the list of ALL plans, best first, in
+                 msg['candidates'] (see enumerate_plans()).
+      prune      passed to enumerate_plans().
 
     The spws in `table` must be the spws of imlist.
+
+    Every plan is enumerated and scored (enumerate_plans()); the plan with
+    the highest score is returned.
 
     final_table has one row per spw: the lever values (n_bin, PB, cell,
     ROI, nfields), min_steps / levers_used / achieved_reduction (which
     levers were applied), field_reduction, nfields_kept, the baseline and
-    mitigated cube and product sizes, and a boolean 'kept' column. If the
+    mitigated cube and product sizes and a boolean 'kept' column. If the
     limits cannot be met (msg['shortmsg'] says so), no spw is kept.
 
-    msg additionally carries 'lever_scores' (the ranking that drove the
-    choice) and, if the MOUS is large, 'warning'."""
+    msg['scores'] holds the score of every lever for the chosen plan
+    (n_bin, PB, cell, ROI, spws, fields; 1.0 = lever not used) and
+    msg['score'] their product, the final score in [0, 1]: 1 = no
+    mitigation necessary, 0 = the limits cannot be met. If the MOUS is
+    large, msg['warning']."""
     cube_sizes, product_sizes, n_fields_in_list = sizes_from_imlist(
         imlist, get_nchan, full_pol
     )
@@ -710,10 +786,35 @@ def plan(
     if nfields is None:
         nfields = n_fields_in_list
 
-    table, scores = mitigate(table, limits, cube_sizes, product_sizes, nfields)
-    selected, msg = select_spws(table, limits, repr_spw)
-    table["kept"] = table.index.isin(selected.index) if selected is not None else False
-    msg["lever_scores"] = scores
+    table = add_nfields_columns(table, nfields)
+    table = add_size_columns(
+        table, cube_sizes, product_sizes, limits.maxcubesize, limits.maxcubelimit
+    )
+    plans = enumerate_plans(table, limits, repr_spw, nfields, prune)
+    best = plans.iloc[0]
+
+    if best["feasible"]:
+        spws = [c for c in plans.columns[: len(table)]]
+        table = _apply_plan(table, best, spws, nfields)
+        mitigated = best["n_levers"] > 0 or best["n_spws_kept"] < len(table)
+        mitigated = mitigated or best["nfields_kept"] < nfields
+        msg = {
+            "longmsg": (
+                "Size was mitigated" if mitigated else "No size mitigation needed"
+            ),
+            "shortmsg": "Size was mitigated" if mitigated else "No size mitigation",
+        }
+        msg["scores"] = best[CUBE_LEVER_COLUMNS + ["spws", "fields"]].astype(float)
+        msg["score"] = float(best["score"])
+    else:
+        table["kept"] = False
+        msg = _failure_message(table, limits, repr_spw)
+        msg["scores"] = pd.Series(
+            float("nan"), index=CUBE_LEVER_COLUMNS + ["spws", "fields"]
+        )
+        msg["score"] = 0.0
+    if return_candidates:
+        msg["candidates"] = plans
     warning = runtime_warning(nfields, sum(get_nchan(spw) for spw in cube_sizes))
     if warning:
         msg["warning"] = warning
@@ -786,18 +887,17 @@ if __name__ == "__main__":
     final, msg = plan(
         table, limits, example_imlist, nchan_by_spw.__getitem__, repr_spw="16 (repr.)"
     )
-    print("\nLever scores (product-weighted mitigation, best first):")
-    print(msg["lever_scores"].round(3).to_string())
-    print(f"\nResult: {msg['shortmsg']}")
+    print(f"\nResult: {msg['shortmsg']}  (final score {msg['score']:.3f})")
+    print(msg["scores"].round(3).to_string())
     print(final.round(3).to_string())
 
     # Same MOUS observed with 3 fields: the number of fields is read from
-    # the imlist, and nfields competes with the other levers by score.
+    # the imlist; fields are only dropped as a last resort.
     imlist_3 = [dict(t, field=f) for f in ("f1", "f2", "f3") for t in example_imlist]
     final3, msg3 = plan(
         table, limits, imlist_3, nchan_by_spw.__getitem__, repr_spw="16 (repr.)"
     )
     print("\n--- same MOUS with 3 fields ---")
-    print(msg3["lever_scores"].round(3).to_string())
-    print(f"\nResult: {msg3['shortmsg']}")
+    print(f"\nResult: {msg3['shortmsg']}  (final score {msg3['score']:.3f})")
+    print(msg3["scores"].round(3).to_string())
     print(final3.round(3).to_string())
