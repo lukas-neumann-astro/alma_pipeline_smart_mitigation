@@ -11,12 +11,14 @@ rated with a single QUALITY SCORE between 0 and 1:
     else the more (and the more drastic) mitigation was needed, the lower
 
 Every lever returns its own score, and the final score is their product.
-A lever's score comes from the SIZE it removes (the same mitigation_*
-functions that give the size reductions):
+A lever's score comes from the SIZE that is left after it (the same
+size_fraction_* functions that give the size fractions, 1 = nothing
+removed, 0 = everything removed):
 
-    score = (1 - reduction) ** (1 / weight)       see lever_score()
+    score = size_fraction ** (1 / weight)         see lever_score()
 
-i.e. the fraction of the size that is left, softened by the lever's weight.
+i.e. the base score is the fraction of the size that is left (weight 1),
+and the lever's weight softens or sharpens it.
 The weights (LEVER_WEIGHTS, or plan(..., weights={...})) are the priorities
 of the levers: the higher the weight, the milder the penalty and the more
 the lever is preferred. By default n_bin, PB and cell (they only reduce
@@ -42,7 +44,7 @@ How the plan is chosen (enumerate_plans() / plan()):
   (plan(..., return_candidates=True) -> msg['candidates']).
 
 The result of plan() is a single table with one row per spw (lever values,
-levers applied, achieved reduction, mitigated sizes, kept or not, the spw's
+levers applied, achieved size fraction, mitigated sizes, kept or not, the spw's
 own lever score) plus msg['scores'], the score of every lever and the final
 score.
 
@@ -71,14 +73,14 @@ KNOWN SIMPLIFICATIONS (worth resolving before this governs real imaging runs):
     ROI are always applied in full (down to the floor / the given ROI).
   - Levers are assumed to compound independently (1 - prod(1 - r_i)); n_bin
     and ROI both act on the spectral axis, so this may not hold.
-  - The reduction of the cube-level levers is applied equally to the product
+  - The size fraction of the cube-level levers is applied equally to the product
     size and the cube size (the product size also contains the MFS term,
     which n_bin does not affect).
   - The score of n_bin/PB/cell/ROI over the MOUS is the plain mean over the
     kept spws of the per-spw scores (not weighted by size).
-  - The spw lever's reduction is the share of the baseline product size that
-    sits in the removed spws; the field lever's reduction assumes equal-sized
-    fields (mitigation_fields()).
+  - The spw lever's size fraction is the share of the baseline product size
+    that stays with the kept spws; the field lever's size fraction assumes
+    equal-sized fields (size_fraction_fields()).
 """
 
 import itertools
@@ -176,78 +178,83 @@ def sizes_from_imlist(
 
 
 # =============================================================================
-# Per-lever mitigation formulas
+# Per-lever size fractions (the fraction of the size that is left)
 # =============================================================================
 
 
-def mitigation_nbin(nchan: int, ratio_satisfied: bool = False) -> float:
-    """n_bin lever. Eligibility is a lookup, not a continuous function:
-    nchan in (7680, 3840) is always eligible for nbin=2; nchan in
-    (1920, 960, 480) is only eligible if the channel-width ratio
-    condition is met. Reduction is exact: 1 - 1/nbin."""
+def size_fraction_nbin(nchan: int, ratio_satisfied: bool = False) -> float:
+    """n_bin lever: the fraction of the size that is left (1 = nothing is
+    removed, 0.5 = half is left). Eligibility is a lookup, not a continuous
+    function: nchan in (7680, 3840) is always eligible for nbin=2; nchan in
+    (1920, 960, 480) is only eligible if the channel-width ratio condition
+    is met. The fraction is exact: 1/nbin."""
     if nchan in (7680, 3840):
         nbin = 2
     elif nchan in (1920, 960, 480) and ratio_satisfied:
         nbin = 2
     else:
         nbin = 1
-    return 1.0 - 1.0 / nbin
+    return 1.0 / nbin
 
 
-def mitigation_pb(pb: float, is_mosaic: bool = False, floor: float = 0.7) -> float:
-    """PB (FoV) lever. Not available for mosaics. For single pointings,
-    tightening PB down to `floor` removes 1 - (floor/pb)^2 of the area
-    (only positive once pb exceeds the floor)."""
+def size_fraction_pb(pb: float, is_mosaic: bool = False, floor: float = 0.7) -> float:
+    """PB (FoV) lever: the fraction of the size that is left. Not available
+    for mosaics (1.0). For single pointings, tightening PB down to `floor`
+    leaves (floor/pb)^2 of the area (1.0 once pb is at or below the
+    floor)."""
     if is_mosaic:
-        return 0.0
+        return 1.0
     if pb <= floor:
-        return 0.0
-    return 1.0 - (floor / pb) ** 2
+        return 1.0
+    return (floor / pb) ** 2
 
 
-def mitigation_cell(ppb: float, robust: float | None = None) -> float:
-    """Cell size (hm_cell) lever. Floor depends on robust: 3.25 ppb for
-    robust=2.0 (PIPE-107), else 3.0 ppb. Same area-scaling form as PB."""
+def size_fraction_cell(ppb: float, robust: float | None = None) -> float:
+    """Cell size (hm_cell) lever: the fraction of the size that is left.
+    Floor depends on robust: 3.25 ppb for robust=2.0 (PIPE-107), else
+    3.0 ppb. Same area-scaling form as PB."""
     floor = 3.25 if robust == 2.0 else 3.0
     if ppb <= floor:
-        return 0.0
-    return 1.0 - (floor / ppb) ** 2
+        return 1.0
+    return (floor / ppb) ** 2
 
 
-def mitigation_roi(n_roi: float, n_total: float) -> float:
-    """ROI (channel selection) lever. Not yet implemented in the
-    pipeline. Linear in the fraction of channels kept, since it's a
-    1-D cut along the spectral axis rather than a 2-D area cut."""
+def size_fraction_roi(n_roi: float, n_total: float) -> float:
+    """ROI (channel selection) lever: the fraction of the size that is left.
+    Not yet implemented in the pipeline. Linear in the fraction of channels
+    kept, since it's a 1-D cut along the spectral axis rather than a 2-D
+    area cut."""
     if n_total <= 0:
         raise ValueError("n_total must be positive")
     if n_roi > n_total:
         raise ValueError("n_roi cannot exceed n_total")
-    return 1.0 - n_roi / n_total
+    return n_roi / n_total
 
 
-def mitigation_fields(n_fields_total: int, n_fields_kept: int) -> float:
-    """Field/target-count lever (Step 2, aggregate product size -- not a
-    per-spw cube-size lever like the four above). Assumes each field
-    contributes an equal share of the total product size, so the
-    fractional reduction scales directly with the fraction of fields
-    dropped: removing 4 of 5 fields removes 4/5 = 0.8 of the size.
+def size_fraction_fields(n_fields_total: int, n_fields_kept: int) -> float:
+    """Field/target-count lever (aggregate product size -- not a per-spw
+    cube-size lever like the four above): the fraction of the size that is
+    left. Assumes each field contributes an equal share of the total
+    product size, so the fraction is the fraction of fields kept: keeping
+    1 of 5 fields leaves 1/5 = 0.2 of the size.
 
     n_fields_kept must be between 1 (only the representative field
     survives -- the theoretical floor, same idea as PB/cell's floor) and
-    n_fields_total (nothing dropped)."""
+    n_fields_total (nothing dropped, 1.0)."""
     if n_fields_total <= 0:
         raise ValueError("n_fields_total must be positive")
     if not (1 <= n_fields_kept <= n_fields_total):
         raise ValueError("n_fields_kept must be between 1 and n_fields_total")
-    return (n_fields_total - n_fields_kept) / n_fields_total
+    return n_fields_kept / n_fields_total
 
 
-def mitigation_spws(n_spws_total: int, n_spws_removed: int) -> float:
+def size_fraction_spws(n_spws_total: int, n_spws_removed: int) -> float:
     """Spectral-window removal (aggregate product size -- not a per-spw cube
-    lever). Assumes every spw contributes an equal share of the total
-    product size, so the fractional reduction is the fraction of spws
-    removed: removing 4 of 5 spws removes 4/5 = 0.8 of the size. (The
-    planner uses the actual per-spw sizes; this is the idealised curve.)
+    lever): the fraction of the size that is left. Assumes every spw
+    contributes an equal share of the total product size, so the fraction
+    is the fraction of spws kept: removing 4 of 5 spws leaves 1/5 = 0.2 of
+    the size. (The planner uses the actual per-spw sizes; this is the
+    idealised curve.)
 
     n_spws_removed runs from 0 to n_spws_total - 1: the representative spw
     is always kept."""
@@ -255,24 +262,25 @@ def mitigation_spws(n_spws_total: int, n_spws_removed: int) -> float:
         raise ValueError("n_spws_total must be positive")
     if not (0 <= n_spws_removed <= n_spws_total - 1):
         raise ValueError("n_spws_removed must be between 0 and n_spws_total - 1")
-    return n_spws_removed / n_spws_total
+    return (n_spws_total - n_spws_removed) / n_spws_total
 
 
-def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
-    """Fewest fields to remove for a required product reduction. There is
-    no menu of levers to choose from here -- mitigation_fields() is a
-    single, linear function of how many fields are removed -- so the count
-    is solved directly:
+def minimum_fields_to_remove(n_fields_total: int, required_size_fraction: float):
+    """Fewest fields to remove to bring the product size down to
+    `required_size_fraction` of its current value. There is no menu of
+    levers to choose from here -- size_fraction_fields() is a single,
+    linear function of how many fields are removed -- so the count is
+    solved directly:
 
-        k = ceil(required_reduction * n_fields_total)
+        k = ceil((1 - required_size_fraction) * n_fields_total)
 
     capped at n_fields_total - 1 so the representative field is always
-    kept. Returns (n_fields_removed, achieved_reduction)."""
-    if required_reduction <= 0 or n_fields_total <= 1:
-        return 0, 0.0
+    kept. Returns (n_fields_removed, achieved_size_fraction)."""
+    if required_size_fraction >= 1 or n_fields_total <= 1:
+        return 0, 1.0
     max_removable = n_fields_total - 1
-    k = min(math.ceil(required_reduction * n_fields_total), max_removable)
-    return k, k / n_fields_total
+    k = min(math.ceil((1 - required_size_fraction) * n_fields_total), max_removable)
+    return k, (n_fields_total - k) / n_fields_total
 
 
 # =============================================================================
@@ -292,29 +300,28 @@ LEVER_WEIGHTS = {
 }
 
 
-def lever_score(reduction: float, weight: float) -> float:
-    """Score of one lever from the size reduction it delivers:
+def lever_score(size_fraction: float, weight: float) -> float:
+    """Score of one lever from the fraction of the size that is left after
+    it (the output of the size_fraction_* functions; 1 = nothing removed):
 
-        score = (1 - reduction) ** (1 / weight)
+        score = size_fraction ** (1 / weight)
 
-    `reduction` is the fraction of the size removed (the output of the
-    mitigation_* functions); 1 - reduction is what is left, the base score.
-    The weight modifies the base score multiplicatively, in the exponent:
-    with weight 1 the score is simply the fraction of the size that is
-    left, so a mitigation that removes 80 % scores 0.2. A larger weight
-    softens the penalty (weight 10: 0.2 ** 0.1 = 0.85), a smaller one
-    sharpens it. A lever that removes nothing always scores 1, whatever its
-    weight, so a plan without mitigation scores 1.
+    The base score is the size fraction itself (weight 1): a mitigation
+    that leaves 20 % of the size scores 0.2. The weight modifies the base
+    score multiplicatively, in the exponent: a larger weight softens the
+    penalty (weight 10: 0.2 ** 0.1 = 0.85), a smaller one sharpens it. A
+    lever that removes nothing always scores 1, whatever its weight, so a
+    plan without mitigation scores 1.
 
-    In log space the cost of a lever is -ln(1 - reduction) / weight, so the
+    In log space the cost of a lever is -ln(size_fraction) / weight, so the
     scores of several levers multiply (costs add up) and the weights
     decide which lever is the cheaper way to remove a given amount."""
-    if not -1e-9 <= reduction <= 1.0 + 1e-9:
-        raise ValueError("reduction must be between 0 and 1")
-    reduction = min(max(reduction, 0.0), 1.0)  # rounding noise
+    if not -1e-9 <= size_fraction <= 1.0 + 1e-9:
+        raise ValueError("size_fraction must be between 0 and 1")
+    size_fraction = min(max(size_fraction, 0.0), 1.0)  # rounding noise
     if weight <= 0:
         raise ValueError("weight must be positive")
-    return (1.0 - reduction) ** (1.0 / weight)
+    return size_fraction ** (1.0 / weight)
 
 
 def _weights(weights: dict | None) -> dict:
@@ -332,12 +339,12 @@ def cube_lever_qualities(
     table: pd.DataFrame, weights: dict | None = None
 ) -> pd.DataFrame:
     """Score each cube lever WOULD have if applied to each spw (rows: spws,
-    columns: CUBE_LEVER_COLUMNS), from the lever's size reduction in the
-    table. Levers that cannot be applied (reduction 0) score 1.0."""
+    columns: CUBE_LEVER_COLUMNS), from the lever's size fraction in the
+    table. Levers that cannot be applied (size fraction 1) score 1.0."""
     w = _weights(weights)
     q = pd.DataFrame(index=table.index)
     for lever in CUBE_LEVER_COLUMNS:
-        q[lever] = [lever_score(r, w[lever]) for r in table[lever]]
+        q[lever] = [lever_score(f, w[lever]) for f in table[lever]]
     return q
 
 
@@ -351,35 +358,29 @@ CUBE_LEVER_COLUMNS = ["n_bin", "PB", "cell", "ROI"]
 LEVER_COLUMNS = CUBE_LEVER_COLUMNS + ["nfields"]
 
 
-def total_reduction(row: pd.Series, columns: list[str] = LEVER_COLUMNS) -> float:
-    """Combined fractional size reduction if all levers in `columns` were
+def total_size_fraction(row: pd.Series, columns: list[str] = LEVER_COLUMNS) -> float:
+    """Fraction of the size that is left if all levers in `columns` were
     applied together, assuming they act independently/multiplicatively on
-    the remaining size: applying reductions r_1, r_2, ... in sequence
-    leaves a fraction (1-r_1)*(1-r_2)*... of the original size, so the
-    total reduction is 1 minus that product.
+    the remaining size: applying levers that leave the fractions f_1, f_2,
+    ... in sequence leaves f_1 * f_2 * ... of the original size.
 
-    NOTE: this treats the four levers as compounding independently, which
-    is a simplifying assumption -- e.g. n_bin (channels) and ROI (also
+    NOTE: this treats the levers as compounding independently, which is a
+    simplifying assumption -- e.g. n_bin (channels) and ROI (also
     channels) both act along the spectral axis, so applying both is not
     obviously independent the way n_bin and PB (spectral vs spatial) are.
     Worth revisiting once the real interaction between levers is known."""
-    remaining = 1.0
-    for col in columns:
-        remaining *= 1.0 - row[col]
-    return 1.0 - remaining
+    return math.prod(row[col] for col in columns)
 
 
 def _refresh_sizes(table: pd.DataFrame) -> pd.DataFrame:
-    """Recomputes the mitigated sizes from the cube-lever reduction
-    (achieved_reduction, hits cube AND product) and the field reduction
-    (field_reduction, hits the product only)."""
-    table["mitigated_cube_GB"] = table["cube_size_GB"] * (
-        1 - table["achieved_reduction"]
-    )
+    """Recomputes the mitigated sizes from the cube-lever size fraction
+    (achieved_size_fraction, hits cube AND product) and the field size
+    fraction (field_size_fraction, hits the product only)."""
+    table["mitigated_cube_GB"] = table["cube_size_GB"] * table["achieved_size_fraction"]
     table["mitigated_product_GB"] = (
         table["product_size_GB"]
-        * (1 - table["achieved_reduction"])
-        * (1 - table["field_reduction"])
+        * table["achieved_size_fraction"]
+        * table["field_size_fraction"]
     )
     return table
 
@@ -393,17 +394,18 @@ def add_size_columns(
 ) -> pd.DataFrame:
     """Extends the lever table with, per spw:
         cube_size_GB, product_size_GB   -- baseline predicted sizes
-        required_reduction              -- 0 if already within the cube target
+        required_size_fraction          -- 1 if already within the cube target
                                             (the smaller of maxcubesize and
                                             maxcubelimit, -1 = unused), else
-                                            1 - target/cube_size
-        min_steps, levers_used, achieved_reduction, field_reduction
-                                         -- nothing applied yet (0, '-', 0, 0);
+                                            target/cube_size: the fraction of
+                                            the cube that may be left
+        min_steps, levers_used, achieved_size_fraction, field_size_fraction
+                                         -- nothing applied yet (0, '-', 1, 1);
                                             filled in for the chosen plan
         mitigated_cube_GB, mitigated_product_GB
                                          -- see _refresh_sizes()
 
-    NOTE: achieved_reduction is applied to product_size_GB as well as
+    NOTE: achieved_size_fraction is applied to product_size_GB as well as
     cube_size_GB, i.e. assuming the product size scales down by the same
     fraction as the cube. That's an approximation -- product size also
     includes the mfs image contribution, which the PB/cell/ROI levers
@@ -414,15 +416,15 @@ def add_size_columns(
     targets = [x for x in (maxcubesize, maxcubelimit) if x != -1]  # -1 = no limit
     if targets:
         target = min(targets)
-        table["required_reduction"] = table["cube_size_GB"].map(
-            lambda size: max(0.0, 1.0 - target / size)
+        table["required_size_fraction"] = table["cube_size_GB"].map(
+            lambda size: min(1.0, target / size)
         )
     else:
-        table["required_reduction"] = 0.0
+        table["required_size_fraction"] = 1.0
     table["min_steps"] = 0
     table["levers_used"] = "-"
-    table["achieved_reduction"] = 0.0
-    table["field_reduction"] = 0.0
+    table["achieved_size_fraction"] = 1.0
+    table["field_size_fraction"] = 1.0
     return _refresh_sizes(table)
 
 
@@ -433,19 +435,19 @@ def add_nfields_columns(table: pd.DataFrame, nfields: int) -> pd.DataFrame:
     across the same set of fields), not a per-spw property. It is applied
     identically to every row:
         nfields_total -- the field count itself
-        nfields       -- the THEORETICAL MAXIMUM mitigation from dropping
-                         every non-representative field (n_fields_kept=1),
-                         the same way the PB/cell columns show their
-                         floor-capped maximum
-    total_reduction is recomputed, since it compounds over LEVER_COLUMNS,
-    which includes 'nfields'."""
+        nfields       -- the size fraction that is left when every
+                         non-representative field is dropped
+                         (n_fields_kept=1), the same way the PB/cell
+                         columns show their floor-capped minimum
+    total_size_fraction is recomputed, since it compounds over
+    LEVER_COLUMNS, which includes 'nfields'."""
     if nfields < 1:
         raise ValueError("nfields must be >= 1")
     table = table.copy()
     table["nfields_total"] = nfields
     table["nfields_kept"] = nfields
-    table["nfields"] = mitigation_fields(nfields, 1)
-    table["total_reduction"] = table.apply(total_reduction, axis=1)
+    table["nfields"] = size_fraction_fields(nfields, 1)
+    table["total_size_fraction"] = table.apply(total_size_fraction, axis=1)
     return table
 
 
@@ -455,15 +457,18 @@ def build_mitigation_table(
     """spw_rows: one dict per spw with keys:
         spw, nchan, ratio_satisfied, pb, is_mosaic, ppb, robust
         and, only if use_roi=True: n_roi, n_total
-    Returns a DataFrame indexed by spw with one column per lever plus a
-    'total_reduction' column giving the compounded reduction across all
-    levers in LEVER_COLUMNS (see total_reduction() above).
+    Returns a DataFrame indexed by spw with one column per lever, holding
+    the fraction of the size that is left when the lever is applied in full
+    (1 = the lever cannot remove anything), plus a 'total_size_fraction'
+    column: the fraction left when all levers in LEVER_COLUMNS are applied
+    (see total_size_fraction() above).
 
     use_roi: ROI is not yet an implemented pipeline parameter (see
-    mitigation_roi()'s docstring), so it is OFF by default. With
-    use_roi=False, the ROI column is filled with 0.0 for every spw --
-    i.e. present in the table for a consistent shape, but contributing
-    no reduction anywhere, so it is never applied (levers whose value is <= 0 are skipped).
+    size_fraction_roi()'s docstring), so it is OFF by default. With
+    use_roi=False, the ROI column is filled with 1.0 for every spw --
+    i.e. present in the table for a consistent shape, but removing
+    nothing anywhere, so it is never applied (levers whose value is 1 are
+    skipped).
     spw_rows entries don't need 'n_roi'/'n_total' keys at all when
     use_roi=False. Pass use_roi=True (and provide n_roi/n_total per spw)
     to switch it on once the real ROI parameter exists in the context.
@@ -475,7 +480,7 @@ def build_mitigation_table(
     that counts; passing it here only makes the raw table show the nfields
     column. See add_nfields_columns() for what the column holds.
 
-    'nfields' is part of LEVER_COLUMNS, so it takes part in total_reduction
+    'nfields' is part of LEVER_COLUMNS, so it takes part in total_size_fraction
     (the POTENTIAL total over all levers). Unlike the other levers it only
     shrinks the product total, never a single cube, so the per-spw cube
     search ignores it (CUBE_LEVER_COLUMNS); plan() decides how many fields
@@ -483,15 +488,15 @@ def build_mitigation_table(
     """
     records = []
     for row in spw_rows:
-        roi_value = mitigation_roi(row["n_roi"], row["n_total"]) if use_roi else 0.0
+        roi_value = size_fraction_roi(row["n_roi"], row["n_total"]) if use_roi else 1.0
         records.append(
             {
                 "spw": row["spw"],
-                "n_bin": mitigation_nbin(
+                "n_bin": size_fraction_nbin(
                     row["nchan"], row.get("ratio_satisfied", False)
                 ),
-                "PB": mitigation_pb(row["pb"], row.get("is_mosaic", False)),
-                "cell": mitigation_cell(row["ppb"], row.get("robust")),
+                "PB": size_fraction_pb(row["pb"], row.get("is_mosaic", False)),
+                "cell": size_fraction_cell(row["ppb"], row.get("robust")),
                 "ROI": roi_value,
             }
         )
@@ -525,38 +530,40 @@ def _spw_options(row: pd.Series, qualities: pd.Series, prune: bool) -> list[dict
     """All sensible cube-lever combinations for one spw.
 
     A combination is sensible if it brings the cube under the cube target
-    (required_reduction); if no combination can, only the one applying every
-    available lever is (the cube is then as small as it can get). With
-    prune=True, a combination is dropped when another one reduces at least
-    as much AND scores at least as well on every lever -- it can never be
-    part of a better plan, so this loses nothing but diagnostic rows."""
-    available = [lv for lv in CUBE_LEVER_COLUMNS if row[lv] > 0]
+    (required_size_fraction); if no combination can, only the one applying
+    every available lever is (the cube is then as small as it can get). With
+    prune=True, a combination is dropped when another one leaves at most as
+    much of the size AND scores at least as well on every lever -- it can
+    never be part of a better plan, so this loses nothing but diagnostic
+    rows."""
+    available = [lv for lv in CUBE_LEVER_COLUMNS if row[lv] < 1]
     options = []
     for subset in _lever_subsets(available):
-        remaining = 1.0
-        for lv in subset:
-            remaining *= 1.0 - row[lv]
         options.append(
             {
                 "levers": subset,
-                "reduction": 1.0 - remaining,
+                "size_fraction": math.prod(row[lv] for lv in subset),
                 "q": tuple(
                     qualities[lv] if lv in subset else 1.0 for lv in CUBE_LEVER_COLUMNS
                 ),
             }
         )
     reaching = [
-        o for o in options if o["reduction"] >= row["required_reduction"] - 1e-12
+        o
+        for o in options
+        if o["size_fraction"] <= row["required_size_fraction"] + 1e-12
     ]
-    options = reaching or [max(options, key=lambda o: o["reduction"])]
+    options = reaching or [min(options, key=lambda o: o["size_fraction"])]
     if prune:
         options = [
             o
             for i, o in enumerate(options)
             if not any(
-                p["reduction"] >= o["reduction"]
+                p["size_fraction"] <= o["size_fraction"]
                 and all(a >= b for a, b in zip(p["q"], o["q"]))
-                and (p["reduction"] > o["reduction"] or p["q"] != o["q"] or j < i)
+                and (
+                    p["size_fraction"] < o["size_fraction"] or p["q"] != o["q"] or j < i
+                )
                 for j, p in enumerate(options)
                 if j != i
             )
@@ -619,11 +626,11 @@ def enumerate_plans(
         kept = [spws[0]] + [s for i, s in enumerate(spws[1:]) if mask >> i & 1]
         for combo in itertools.product(*(options[s] for s in kept)):
             cubes = [
-                table.at[s, "cube_size_GB"] * (1 - o["reduction"])
+                table.at[s, "cube_size_GB"] * o["size_fraction"]
                 for s, o in zip(kept, combo)
             ]
             product0 = sum(
-                table.at[s, "product_size_GB"] * (1 - o["reduction"])
+                table.at[s, "product_size_GB"] * o["size_fraction"]
                 for s, o in zip(kept, combo)
             )
             cube_ok = limit == -1 or (
@@ -635,19 +642,19 @@ def enumerate_plans(
                 sum(o["q"][i] for o in combo) / len(kept)
                 for i in range(len(CUBE_LEVER_COLUMNS))
             ]
-            # the size share removed with the dropped spws (the equal-size
-            # special case is mitigation_spws())
-            kept_share = (
+            # the share of the product size that stays with the kept spws
+            # (the equal-size special case is size_fraction_spws())
+            spw_size_fraction = (
                 sum(table.at[s, "product_size_GB"] for s in kept) / total_product
             )
-            spw_score = lever_score(1.0 - kept_share, w["spws"])
+            spw_score = lever_score(spw_size_fraction, w["spws"])
             levers = {s: ",".join(o["levers"]) or "-" for s, o in zip(kept, combo)}
             n_levers = sum(len(o["levers"]) for o in combo)
             for n_kept in range(1, nfields + 1):
                 product = product0 * n_kept / nfields
                 feasible = cube_ok and (budget == -1 or product <= budget + 1e-9)
                 field_score = lever_score(
-                    mitigation_fields(nfields, n_kept), w["fields"]
+                    size_fraction_fields(nfields, n_kept), w["fields"]
                 )
                 score = math.prod(lever_scores) * spw_score * field_score
                 rows.append(
@@ -678,10 +685,9 @@ def _apply_plan(table: pd.DataFrame, best: pd.Series, spws: list[str], nfields: 
         if used == "dropped":
             continue
         levers = [] if used == "-" else used.split(",")
-        remaining = 1.0
-        for lever in levers:
-            remaining *= 1.0 - table.at[spw, lever]
-        table.at[spw, "achieved_reduction"] = 1.0 - remaining
+        table.at[spw, "achieved_size_fraction"] = math.prod(
+            table.at[spw, lever] for lever in levers
+        )
         table.at[spw, "levers_used"] = used
         table.at[spw, "min_steps"] = len(levers)
     table["kept"] = [best[spw] != "dropped" for spw in table.index]
@@ -694,13 +700,13 @@ def _apply_plan(table: pd.DataFrame, best: pd.Series, spws: list[str], nfields: 
 
 def _apply_fields(table: pd.DataFrame, n_fields: int, n_removed: int) -> pd.DataFrame:
     """Drops n_removed of the n_fields fields (the representative field is
-    always among the kept ones). Product-size lever only: field_reduction
+    always among the kept ones). Product-size lever only: field_size_fraction
     hits mitigated_product_GB, not mitigated_cube_GB. The 'nfields' column
     changes from its theoretical maximum to the value actually achieved."""
     table = table.copy()
-    reduction = mitigation_fields(n_fields, n_fields - n_removed)
-    table["nfields"] = reduction
-    table["field_reduction"] = reduction
+    size_fraction = size_fraction_fields(n_fields, n_fields - n_removed)
+    table["nfields"] = size_fraction
+    table["field_size_fraction"] = size_fraction
     table["nfields_kept"] = n_fields - n_removed
     table["levers_used"] = [
         "nfields" if used == "-" else used + ",nfields" for used in table["levers_used"]
@@ -712,8 +718,8 @@ def _apply_fields(table: pd.DataFrame, n_fields: int, n_removed: int) -> pd.Data
 def _failure_message(table: pd.DataFrame, limits: Limits, repr_spw: str) -> dict:
     """Why no plan is feasible: the representative spw's cube cannot be
     brought under maxcubelimit, or the product budget cannot be met."""
-    cube_floor = table.at[repr_spw, "cube_size_GB"] * (
-        1 - total_reduction(table.loc[repr_spw], CUBE_LEVER_COLUMNS)
+    cube_floor = table.at[repr_spw, "cube_size_GB"] * total_size_fraction(
+        table.loc[repr_spw], CUBE_LEVER_COLUMNS
     )
     if limits.maxcubelimit != -1 and cube_floor > limits.maxcubelimit:
         return {
@@ -724,8 +730,9 @@ def _failure_message(table: pd.DataFrame, limits: Limits, repr_spw: str) -> dict
             "failure": "cube",
         }
     smallest = (
-        1 - total_reduction(table.loc[repr_spw], CUBE_LEVER_COLUMNS)
-    ) / table.at[repr_spw, "nfields_total"]
+        total_size_fraction(table.loc[repr_spw], CUBE_LEVER_COLUMNS)
+        / table.at[repr_spw, "nfields_total"]
+    )
     product_floor = table.at[repr_spw, "product_size_GB"] * smallest
     return {
         "longmsg": "Product size could not be mitigated. Remaining factor: %.4f."
@@ -800,8 +807,8 @@ def plan(
     the highest score is returned.
 
     final_table has one row per spw: the lever values (n_bin, PB, cell,
-    ROI, nfields), min_steps / levers_used / achieved_reduction (which
-    levers were applied), field_reduction, nfields_kept, the baseline and
+    ROI, nfields), min_steps / levers_used / achieved_size_fraction (which
+    levers were applied), field_size_fraction, nfields_kept, the baseline and
     mitigated cube and product sizes and a boolean 'kept' column. If the
     limits cannot be met (msg['shortmsg'] says so), no spw is kept.
 
