@@ -283,31 +283,38 @@ def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
 # lever (the milder its penalty), so the more the planner prefers it. This is
 # the one place to change the priorities of the mitigation levers.
 LEVER_WEIGHTS = {
-    "n_bin": 1,  # moderate: only the data quality suffers
-    "PB": 1,  # moderate
-    "cell": 1,  # moderate
-    "ROI": 0.2,  # a part of the spw is lost
-    "spws": 0.1,  # whole spws are lost
-    "fields": 0.01,  # whole fields are lost
+    "n_bin": 100.0,  # moderate: only the data quality suffers
+    "PB": 100.0,  # moderate
+    "cell": 100.0,  # moderate
+    "ROI": 20.0,  # a part of the spw is lost
+    "spws": 10.0,  # whole spws are lost
+    "fields": 1.0,  # whole fields are lost
 }
 
 
 def lever_score(reduction: float, weight: float) -> float:
     """Score of one lever from the size reduction it delivers:
 
-        score = (1 - reduction) * weight
+        score = (1 - reduction) ** (1 / weight)
 
     `reduction` is the fraction of the size removed (the output of the
-    mitigation_* functions); 1 - reduction is what is left. With weight 1
-    the score is simply the fraction of the size that is left, so a
-    mitigation that removes 80 % scores 0.2. A smaller weight sharpens the
-    penalty (weight 0.1: 0.2 * 0.1 = 0.02), a larger one softens it."""
+    mitigation_* functions); 1 - reduction is what is left, the base score.
+    The weight modifies the base score multiplicatively, in the exponent:
+    with weight 1 the score is simply the fraction of the size that is
+    left, so a mitigation that removes 80 % scores 0.2. A larger weight
+    softens the penalty (weight 10: 0.2 ** 0.1 = 0.85), a smaller one
+    sharpens it. A lever that removes nothing always scores 1, whatever its
+    weight, so a plan without mitigation scores 1.
+
+    In log space the cost of a lever is -ln(1 - reduction) / weight, so the
+    scores of several levers multiply (costs add up) and the weights
+    decide which lever is the cheaper way to remove a given amount."""
     if not -1e-9 <= reduction <= 1.0 + 1e-9:
         raise ValueError("reduction must be between 0 and 1")
     reduction = min(max(reduction, 0.0), 1.0)  # rounding noise
     if weight <= 0:
         raise ValueError("weight must be positive")
-    return (1.0 - reduction) *  weight
+    return (1.0 - reduction) ** (1.0 / weight)
 
 
 def _weights(weights: dict | None) -> dict:
