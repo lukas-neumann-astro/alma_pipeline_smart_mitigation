@@ -71,8 +71,9 @@ KNOWN SIMPLIFICATIONS (worth resolving before this governs real imaging runs):
     PB_limit)) is not modelled: only WHICH levers are used per spw is
     tracked, not the parameter value each lever converges to. PB, cell and
     ROI are always applied in full (down to the floor / the given ROI).
-  - Levers are assumed to compound independently (1 - prod(1 - r_i)); n_bin
-    and ROI both act on the spectral axis, so this may not hold.
+  - Levers are assumed to compound independently (the size fractions
+    multiply); n_bin and ROI both act on the spectral axis, so this may not
+    hold.
   - The size fraction of the cube-level levers is applied equally to the product
     size and the cube size (the product size also contains the MFS term,
     which n_bin does not affect).
