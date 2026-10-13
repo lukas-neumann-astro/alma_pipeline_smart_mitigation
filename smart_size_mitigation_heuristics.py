@@ -122,6 +122,31 @@ def calculate_sizes(
     return cubesizes, max(cubesizes.values()), productsizes, total_productsize
 
 
+def sizes_from_imlist(
+    imlist: list[dict], get_nchan: Callable[[str], int], full_pol: bool = False
+):
+    """Everything the planner needs to know about sizes, from the imaging
+    target list alone (calculate_sizes() does the arithmetic):
+
+        cube_sizes[spw]    -- largest cube of that spw over all targets
+        product_sizes[spw] -- product size of that spw SUMMED over all its
+                              targets, i.e. over all fields (so that the
+                              sum over spws equals calculate_sizes()'s
+                              total_productsize)
+        nfields            -- number of distinct fields in the list
+
+    Returns (cube_sizes, product_sizes, nfields)."""
+    cube_sizes = calculate_sizes(imlist, get_nchan, full_pol)[0]
+    product_sizes = {
+        spw: calculate_sizes(
+            [t for t in imlist if t["spw"] == spw], get_nchan, full_pol
+        )[3]
+        for spw in cube_sizes
+    }
+    nfields = len({t["field"] for t in imlist})
+    return cube_sizes, product_sizes, nfields
+
+
 # =============================================================================
 # Per-lever mitigation formulas
 # =============================================================================
@@ -643,13 +668,28 @@ def runtime_warning(
 def plan(
     table: pd.DataFrame,
     limits: Limits,
-    cube_sizes: dict,
-    product_sizes: dict,
+    imlist: list[dict],
+    get_nchan: Callable[[str], int],
     repr_spw: str,
-    nfields: int = 1,
-    sum_nchan: int | None = None,
+    full_pol: bool = False,
+    nfields: int | None = None,
 ):
     """Returns (final_table, msg).
+
+    The sizes are not inputs: they are computed from the imaging target
+    list with calculate_sizes() (see sizes_from_imlist()), exactly as the
+    pipeline does for its own default imaging setup.
+
+      imlist     one dict per imaging target: field, spw, imsize=(nx, ny),
+                 nbin (-1 = 1), specmode. In the pipeline: the targets of
+                 makeimlist's result.
+      get_nchan  spw -> number of channels (in the pipeline: from the
+                 reference MS).
+      full_pol   True for full-pol cube imaging (sizes x5).
+      nfields    number of fields, ONE value for all spws. Default: the
+                 number of distinct fields in imlist.
+
+    The spws in `table` must be the spws of imlist.
 
     final_table has one row per spw: the lever values (n_bin, PB, cell,
     ROI, nfields), min_steps / levers_used / achieved_reduction (which
@@ -658,18 +698,25 @@ def plan(
     limits cannot be met (msg['shortmsg'] says so), no spw is kept.
 
     msg additionally carries 'lever_scores' (the ranking that drove the
-    choice) and, if sum_nchan is given and the MOUS is large, 'warning'.
+    choice) and, if the MOUS is large, 'warning'."""
+    cube_sizes, product_sizes, n_fields_in_list = sizes_from_imlist(
+        imlist, get_nchan, full_pol
+    )
+    if set(table.index) != set(cube_sizes):
+        raise ValueError(
+            f"table spws {sorted(table.index)} do not match imlist spws "
+            f"{sorted(cube_sizes)}"
+        )
+    if nfields is None:
+        nfields = n_fields_in_list
 
-    nfields: number of fields of the MOUS, ONE value for all spws.
-    product_sizes[spw]: product size of that spw summed over all fields."""
     table, scores = mitigate(table, limits, cube_sizes, product_sizes, nfields)
     selected, msg = select_spws(table, limits, repr_spw)
     table["kept"] = table.index.isin(selected.index) if selected is not None else False
     msg["lever_scores"] = scores
-    if sum_nchan is not None:
-        warning = runtime_warning(nfields, sum_nchan)
-        if warning:
-            msg["warning"] = warning
+    warning = runtime_warning(nfields, sum(get_nchan(spw) for spw in cube_sizes))
+    if warning:
+        msg["warning"] = warning
     return table, msg
 
 
@@ -728,67 +775,29 @@ if __name__ == "__main__":
 
     limits = Limits(maxcubesize=40.0, maxproductsize=150.0, maxcubelimit=60.0)
 
-    # Sizes come from calculate_sizes() on an imlist (in the real pipeline
-    # this is makeimlist's target list; here: one field, one target per spw).
-    example_imlist = [
-        {
-            "field": "f1",
-            "spw": "16 (repr.)",
-            "imsize": (2550, 2550),
-            "nbin": -1,
-            "specmode": "cube",
-        },
-        {
-            "field": "f1",
-            "spw": "18",
-            "imsize": (2200, 2200),
-            "nbin": -1,
-            "specmode": "cube",
-        },
-        {
-            "field": "f1",
-            "spw": "20",
-            "imsize": (1340, 1340),
-            "nbin": -1,
-            "specmode": "cube",
-        },
-        {
-            "field": "f1",
-            "spw": "22",
-            "imsize": (2420, 2420),
-            "nbin": -1,
-            "specmode": "cube",
-        },
-    ]
+    # The sizes are computed from the imaging target list (in the pipeline:
+    # makeimlist's targets) -- here one field with one target per spw.
+    imsizes = {"16 (repr.)": 2550, "18": 2200, "20": 1340, "22": 2420}
     nchan_by_spw = {r["spw"]: r["nchan"] for r in example_spws}
-    cube_sizes, max_cube, product_sizes, total_product = calculate_sizes(
-        example_imlist, nchan_by_spw.__getitem__
-    )
-    print(
-        f"calculate_sizes: max cube {max_cube:.1f} GB, total product {total_product:.1f} GB"
-    )
-
+    example_imlist = [
+        {"field": "f1", "spw": spw, "imsize": (n, n), "nbin": -1, "specmode": "cube"}
+        for spw, n in imsizes.items()
+    ]
     final, msg = plan(
-        table,
-        limits,
-        cube_sizes,
-        product_sizes,
-        repr_spw="16 (repr.)",
-        nfields=1,
-        sum_nchan=sum(r["nchan"] for r in example_spws),
+        table, limits, example_imlist, nchan_by_spw.__getitem__, repr_spw="16 (repr.)"
     )
     print("\nLever scores (product-weighted mitigation, best first):")
     print(msg["lever_scores"].round(3).to_string())
     print(f"\nResult: {msg['shortmsg']}")
     print(final.round(3).to_string())
 
-    # Same MOUS observed with 3 fields: each spw's product size now covers
-    # all 3 fields, and nfields competes with the other levers by score.
-    product_sizes_3 = {spw: 3 * size for spw, size in product_sizes.items()}
+    # Same MOUS observed with 3 fields: the number of fields is read from
+    # the imlist, and nfields competes with the other levers by score.
+    imlist_3 = [dict(t, field=f) for f in ("f1", "f2", "f3") for t in example_imlist]
     final3, msg3 = plan(
-        table, limits, cube_sizes, product_sizes_3, repr_spw="16 (repr.)", nfields=3
+        table, limits, imlist_3, nchan_by_spw.__getitem__, repr_spw="16 (repr.)"
     )
-    print("\n--- same MOUS with nfields=3 ---")
+    print("\n--- same MOUS with 3 fields ---")
     print(msg3["lever_scores"].round(3).to_string())
     print(f"\nResult: {msg3['shortmsg']}")
     print(final3.round(3).to_string())
