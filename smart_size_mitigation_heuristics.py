@@ -262,8 +262,14 @@ def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
 SCORE_NBIN = 0.9  # channel binning, when applied
 SCORE_MIN_PB_CELL = 0.9  # PB / cell at a mitigation of 100 % (never reached)
 SCORE_MIN_ROI = 0.5  # ROI that cuts away (almost) the whole spw
-SCORE_RANGE_SPWS = (0.4, 0.6)  # (worst, best): all other spws / one spw removed
-SCORE_RANGE_FIELDS = (0.2, 0.4)  # (worst, best): all other fields / one removed
+SCORE_RANGE_SPWS = (
+    0.4,
+    0.6,
+)  # (worst, best): all but the repr. spw / almost none removed
+SCORE_RANGE_FIELDS = (
+    0.2,
+    0.4,
+)  # (worst, best): all but the repr. field / almost none removed
 
 
 def score_nbin() -> float:
