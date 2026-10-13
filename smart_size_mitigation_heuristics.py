@@ -58,13 +58,14 @@ from dataclasses import dataclass
 from typing import Callable
 import pandas as pd
 
-
 # =============================================================================
 # Size calculation (ported from CheckProductSizeHeuristics.calculate_sizes)
 # =============================================================================
 
-def calculate_sizes(imlist: list[dict], get_nchan: Callable[[str], int],
-                    full_pol: bool = False):
+
+def calculate_sizes(
+    imlist: list[dict], get_nchan: Callable[[str], int], full_pol: bool = False
+):
     """Same logic as CheckProductSizeHeuristics.calculate_sizes() in
     checkproductsize.py; the only change is that the two lookups it did
     through the pipeline context are passed in instead:
@@ -120,8 +121,9 @@ def calculate_sizes(imlist: list[dict], get_nchan: Callable[[str], int],
     return cubesizes, max(cubesizes.values()), productsizes, total_productsize
 
 
-def field_product_sizes(imlist: list[dict], get_nchan: Callable[[str], int],
-                        full_pol: bool = False) -> dict:
+def field_product_sizes(
+    imlist: list[dict], get_nchan: Callable[[str], int], full_pol: bool = False
+) -> dict:
     """Per-field total product size (sum over that field's spws), computed
     with calculate_sizes() on each field's targets. This is the
     fields_product_sizes input of plan()/step2_field_reduction()."""
@@ -135,6 +137,7 @@ def field_product_sizes(imlist: list[dict], get_nchan: Callable[[str], int],
 # =============================================================================
 # Per-lever mitigation formulas
 # =============================================================================
+
 
 def mitigation_nbin(nchan: int, ratio_satisfied: bool = False) -> float:
     """n_bin lever. Eligibility is a lookup, not a continuous function:
@@ -236,7 +239,7 @@ def total_reduction(row: pd.Series, columns: list[str] = LEVER_COLUMNS) -> float
     Worth revisiting once the real interaction between levers is known."""
     remaining = 1.0
     for col in columns:
-        remaining *= (1.0 - row[col])
+        remaining *= 1.0 - row[col]
     return 1.0 - remaining
 
 
@@ -267,7 +270,7 @@ def minimum_steps_to_target(lever_values: dict, required_reduction: float):
     for lever, value in ordered:
         if value <= 0:
             break  # sorted descending, so no further lever helps
-        remaining *= (1.0 - value)
+        remaining *= 1.0 - value
         used.append(lever)
         achieved = 1.0 - remaining
         if achieved >= required_reduction:
@@ -278,8 +281,13 @@ def minimum_steps_to_target(lever_values: dict, required_reduction: float):
     return len(used), 1.0 - remaining, used
 
 
-def add_size_and_step_columns(table: pd.DataFrame, cube_sizes: dict, product_sizes: dict,
-                               maxcubesize: float, columns: list[str] = LEVER_COLUMNS) -> pd.DataFrame:
+def add_size_and_step_columns(
+    table: pd.DataFrame,
+    cube_sizes: dict,
+    product_sizes: dict,
+    maxcubesize: float,
+    columns: list[str] = LEVER_COLUMNS,
+) -> pd.DataFrame:
     """Extends the lever table with, per spw:
         cube_size_GB, product_size_GB   -- baseline predicted sizes
         required_reduction              -- 0 if already within maxcubesize,
@@ -301,7 +309,8 @@ def add_size_and_step_columns(table: pd.DataFrame, cube_sizes: dict, product_siz
     table["cube_size_GB"] = [cube_sizes[spw] for spw in table.index]
     table["product_size_GB"] = [product_sizes[spw] for spw in table.index]
     table["required_reduction"] = table.apply(
-        lambda r: max(0.0, 1.0 - maxcubesize / r["cube_size_GB"]), axis=1)
+        lambda r: max(0.0, 1.0 - maxcubesize / r["cube_size_GB"]), axis=1
+    )
 
     steps, achieved, used = [], [], []
     for spw, row in table.iterrows():
@@ -314,18 +323,46 @@ def add_size_and_step_columns(table: pd.DataFrame, cube_sizes: dict, product_siz
     table["levers_used"] = used
     table["achieved_reduction"] = achieved
 
-    table["mitigated_cube_GB"] = table["cube_size_GB"] * (1 - table["achieved_reduction"])
-    table["mitigated_product_GB"] = table["product_size_GB"] * (1 - table["achieved_reduction"])
+    table["mitigated_cube_GB"] = table["cube_size_GB"] * (
+        1 - table["achieved_reduction"]
+    )
+    table["mitigated_product_GB"] = table["product_size_GB"] * (
+        1 - table["achieved_reduction"]
+    )
     return table
 
 
-def build_mitigation_table(spw_rows: list[dict], use_roi: bool = False) -> pd.DataFrame:
+def add_nfields_columns(table: pd.DataFrame, nfields: int) -> pd.DataFrame:
+    """Adds/overwrites the field-count columns for a MOUS-wide field count.
+
+    nfields is ONE integer for the whole MOUS (every science spw is imaged
+    across the same set of fields), not a per-spw property. It is applied
+    identically to every row:
+        nfields_total -- the field count itself
+        nfields       -- the THEORETICAL MAXIMUM mitigation from dropping
+                         every non-representative field (n_fields_kept=1),
+                         the same way the PB/cell columns show their
+                         floor-capped maximum
+    total_reduction is recomputed, since it compounds over LEVER_COLUMNS,
+    which includes 'nfields'."""
+    if nfields < 1:
+        raise ValueError("nfields must be >= 1")
+    table = table.copy()
+    table["nfields_total"] = nfields
+    table["nfields"] = mitigation_fields(nfields, 1)
+    table["total_reduction"] = table.apply(total_reduction, axis=1)
+    return table
+
+
+def build_mitigation_table(
+    spw_rows: list[dict], use_roi: bool = False, nfields: int = 1
+) -> pd.DataFrame:
     """spw_rows: one dict per spw with keys:
-        spw, nchan, ratio_satisfied, pb, is_mosaic, ppb, robust, nfields
+        spw, nchan, ratio_satisfied, pb, is_mosaic, ppb, robust
         and, only if use_roi=True: n_roi, n_total
     Returns a DataFrame indexed by spw with one column per lever plus a
     'total_reduction' column giving the compounded reduction across all
-    four CUBE-level levers (see total_reduction() above).
+    levers in LEVER_COLUMNS (see total_reduction() above).
 
     use_roi: ROI is not yet an implemented pipeline parameter (see
     mitigation_roi()'s docstring), so it is OFF by default. With
@@ -337,19 +374,18 @@ def build_mitigation_table(spw_rows: list[dict], use_roi: bool = False) -> pd.Da
     use_roi=False. Pass use_roi=True (and provide n_roi/n_total per spw)
     to switch it on once the real ROI parameter exists in the context.
 
-    'nfields' is the number of fields/targets this spw is imaged across
-    (in the real pipeline, fetched from the context rather than passed by
-    hand). Until Step 2's field_reduction logic actually decides how many
-    fields to drop, the 'nfields' column here shows the THEORETICAL
-    MAXIMUM mitigation from dropping every non-representative field
-    (keeping only the representative, i.e. n_fields_kept=1), the same way
-    the PB/cell columns show their floor-capped maximum.
+    nfields: the number of fields/targets of the MOUS -- ONE integer shared
+    by all spws (in the real pipeline: len(fields) from the context), not a
+    per-spw key. plan() takes the same value as its own `nfields` argument
+    and re-applies it (add_nfields_columns), so plan()'s value is the one
+    that counts; passing it here only makes the raw table show the nfields
+    column. See add_nfields_columns() for what the column holds.
 
     'nfields' is included in LEVER_COLUMNS, so it is treated exactly like
     n_bin/PB/cell/ROI everywhere that reads that list: Step 1's own
     per-spw search (minimum_steps_to_target) may pick it to meet
     maxcubesize, and Step 2b's global escalation may pick it to meet
-    maxproductsize, both using this theoretical-max value -- in addition
+    maxproductsize, both using the theoretical-max value -- in addition
     to it being overwritten with the real achieved value once Step 2a's
     field_reduction formula runs (apply_field_reduction_to_table()).
 
@@ -365,36 +401,41 @@ def build_mitigation_table(spw_rows: list[dict], use_roi: bool = False) -> pd.Da
     records = []
     for row in spw_rows:
         roi_value = mitigation_roi(row["n_roi"], row["n_total"]) if use_roi else 0.0
-        records.append({
-            "spw": row["spw"],
-            "n_bin": mitigation_nbin(row["nchan"], row.get("ratio_satisfied", False)),
-            "PB": mitigation_pb(row["pb"], row.get("is_mosaic", False)),
-            "cell": mitigation_cell(row["ppb"], row.get("robust")),
-            "ROI": roi_value,
-            "nfields_total": row["nfields"],
-            "nfields": mitigation_fields(row["nfields"], 1),
-        })
+        records.append(
+            {
+                "spw": row["spw"],
+                "n_bin": mitigation_nbin(
+                    row["nchan"], row.get("ratio_satisfied", False)
+                ),
+                "PB": mitigation_pb(row["pb"], row.get("is_mosaic", False)),
+                "cell": mitigation_cell(row["ppb"], row.get("robust")),
+                "ROI": roi_value,
+            }
+        )
     table = pd.DataFrame(records).set_index("spw")
-    table["total_reduction"] = table.apply(total_reduction, axis=1)
-    return table
+    return add_nfields_columns(table, nfields)
 
 
 # =============================================================================
 # Limits
 # =============================================================================
 
+
 @dataclass
 class Limits:
-    maxcubesize: float     # GB, per-spw soft target (Step 1)
+    maxcubesize: float  # GB, per-spw soft target (Step 1)
     maxproductsize: float  # GB, aggregate soft target then hard budget (Step 2/3)
-    maxcubelimit: float    # GB, per-spw hard gate (Step 3 only)
+    maxcubelimit: float  # GB, per-spw hard gate (Step 3 only)
 
 
 # =============================================================================
 # Step 2a: field reduction (only relevant when nfields > 1)
 # =============================================================================
 
-def step2_field_reduction(fields_product_sizes: dict, repr_field: str, maxproductsize: float):
+
+def step2_field_reduction(
+    fields_product_sizes: dict, repr_field: str, maxproductsize: float
+):
     """Uses mitigation_fields()/minimum_fields_to_remove() to decide HOW
     MANY fields must be dropped (the uniform-size approximation), then
     uses the actual per-field product sizes to decide WHICH non-
@@ -423,7 +464,8 @@ def step2_field_reduction(fields_product_sizes: dict, repr_field: str, maxproduc
 
     others_desc = sorted(
         ((f, s) for f, s in fields_product_sizes.items() if f != repr_field),
-        key=lambda kv: kv[1], reverse=True,
+        key=lambda kv: kv[1],
+        reverse=True,
     )
     dropped = others_desc[:k]
     kept = [repr_field] + [f for f, _ in others_desc[k:]]
@@ -436,12 +478,15 @@ def step2_field_reduction(fields_product_sizes: dict, repr_field: str, maxproduc
 # ranked by aggregate GB saved)
 # =============================================================================
 
+
 def _remaining_levers(levers_used: str, columns=LEVER_COLUMNS):
     used = set(levers_used.split(",")) if levers_used != "-" else set()
     return [c for c in columns if c not in used]
 
 
-def _apply_additional_lever(table: pd.DataFrame, lever: str, columns=LEVER_COLUMNS) -> pd.DataFrame:
+def _apply_additional_lever(
+    table: pd.DataFrame, lever: str, columns=LEVER_COLUMNS
+) -> pd.DataFrame:
     table = table.copy()
     for idx, row in table.iterrows():
         if lever not in _remaining_levers(row["levers_used"], columns):
@@ -455,13 +500,21 @@ def _apply_additional_lever(table: pd.DataFrame, lever: str, columns=LEVER_COLUM
             row["levers_used"] + "," + lever if row["levers_used"] != "-" else lever
         )
         table.at[idx, "min_steps"] = row["min_steps"] + 1
-    table["mitigated_cube_GB"] = table["cube_size_GB"] * (1 - table["achieved_reduction"])
-    table["mitigated_product_GB"] = table["product_size_GB"] * (1 - table["achieved_reduction"])
+    table["mitigated_cube_GB"] = table["cube_size_GB"] * (
+        1 - table["achieved_reduction"]
+    )
+    table["mitigated_product_GB"] = table["product_size_GB"] * (
+        1 - table["achieved_reduction"]
+    )
     return table
 
 
-def step2_global_escalation(table: pd.DataFrame, maxproductsize: float,
-                             columns=LEVER_COLUMNS, max_iterations: int = 4) -> pd.DataFrame:
+def step2_global_escalation(
+    table: pd.DataFrame,
+    maxproductsize: float,
+    columns=LEVER_COLUMNS,
+    max_iterations: int = 4,
+) -> pd.DataFrame:
     """Repeatedly picks whichever UNUSED lever would save the most
     aggregate GB across all spws that still have it available, applies it
     to every such spw at once, and rechecks the aggregate budget. This is
@@ -478,8 +531,13 @@ def step2_global_escalation(table: pd.DataFrame, maxproductsize: float,
         for lever in columns:
             saved = 0.0
             for _, row in table.iterrows():
-                if lever in _remaining_levers(row["levers_used"], columns) and row[lever] > 0:
-                    current_remaining = row["product_size_GB"] * (1 - row["achieved_reduction"])
+                if (
+                    lever in _remaining_levers(row["levers_used"], columns)
+                    and row[lever] > 0
+                ):
+                    current_remaining = row["product_size_GB"] * (
+                        1 - row["achieved_reduction"]
+                    )
                     saved += current_remaining * row[lever]
             if saved > 0:
                 savings[lever] = saved
@@ -502,13 +560,8 @@ def apply_field_reduction_to_table(table: pd.DataFrame, n_dropped: int) -> pd.Da
     cut shows 'nfields' in levers_used in the printed table exactly like
     n_bin does when chosen.
 
-    ASSUMES every spw shares the same global field count and the same
-    field-reduction decision (n_dropped applies uniformly across all
-    rows) -- true whenever all science-target spws are imaged across the
-    same field set, which step2_field_reduction() itself currently
-    assumes too (it takes one fields_product_sizes dict, not one per spw).
-    If spws ever need independent field counts, this would need to key
-    off each row's own 'nfields_total' and a per-row n_dropped instead."""
+    nfields is a single MOUS-wide count (see add_nfields_columns()), so
+    n_dropped applies uniformly across all rows."""
     if n_dropped <= 0:
         return table
 
@@ -525,13 +578,17 @@ def apply_field_reduction_to_table(table: pd.DataFrame, n_dropped: int) -> pd.Da
 # (budget), operating on the POST mitigation sizes from steps 1 and 2
 # =============================================================================
 
+
 def step3_select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
     repr_row = table.loc[repr_spw]
-    if limits.maxcubelimit != -1 and repr_row["mitigated_cube_GB"] > limits.maxcubelimit:
+    if (
+        limits.maxcubelimit != -1
+        and repr_row["mitigated_cube_GB"] > limits.maxcubelimit
+    ):
         return None, {
             "longmsg": "Cube size could not be mitigated. The representative spw's "
-                       "cube size (%.2f GB) is larger than maxcubelimit (%.2f GB)."
-                       % (repr_row["mitigated_cube_GB"], limits.maxcubelimit),
+            "cube size (%.2f GB) is larger than maxcubelimit (%.2f GB)."
+            % (repr_row["mitigated_cube_GB"], limits.maxcubelimit),
             "shortmsg": "Cube size could not be mitigated",
         }
 
@@ -550,8 +607,11 @@ def step3_select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
     # oversize cap: at most one non-representative spw above 0.5*maxcubelimit
     kept_rows, oversize_used = [], False
     for spw, row in admissible.iterrows():
-        is_oversize = (limits.maxcubelimit != -1 and spw != repr_spw
-                        and row["mitigated_cube_GB"] > 0.5 * limits.maxcubelimit)
+        is_oversize = (
+            limits.maxcubelimit != -1
+            and spw != repr_spw
+            and row["mitigated_cube_GB"] > 0.5 * limits.maxcubelimit
+        )
         if is_oversize:
             if oversize_used:
                 continue
@@ -567,7 +627,10 @@ def step3_select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
             selected.append(spw)
             used += row["mitigated_product_GB"]
             continue
-        if limits.maxproductsize == -1 or used + row["mitigated_product_GB"] <= limits.maxproductsize:
+        if (
+            limits.maxproductsize == -1
+            or used + row["mitigated_product_GB"] <= limits.maxproductsize
+        ):
             selected.append(spw)
             used += row["mitigated_product_GB"]
         else:
@@ -576,13 +639,21 @@ def step3_select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
     if limits.maxproductsize != -1 and used > limits.maxproductsize:
         return None, {
             "longmsg": "Product size could not be mitigated. Remaining factor: %.4f."
-                       % (used / limits.maxproductsize),
+            % (used / limits.maxproductsize),
             "shortmsg": "Product size could not be mitigated",
         }
 
     return table.loc[selected], {
-        "longmsg": "Size was mitigated" if any(table["min_steps"] > 0) else "No size mitigation needed",
-        "shortmsg": "Size was mitigated" if any(table["min_steps"] > 0) else "No size mitigation",
+        "longmsg": (
+            "Size was mitigated"
+            if any(table["min_steps"] > 0)
+            else "No size mitigation needed"
+        ),
+        "shortmsg": (
+            "Size was mitigated"
+            if any(table["min_steps"] > 0)
+            else "No size mitigation"
+        ),
     }
 
 
@@ -590,12 +661,20 @@ def step3_select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
 # Step 4: unchanged runtime warning
 # =============================================================================
 
-def step4_runtime_warning(nfields: int, sum_nchan: int,
-                           max_num_sciencetargets: int = 30, max_sum_nchan: int = 960) -> str | None:
+
+def step4_runtime_warning(
+    nfields: int,
+    sum_nchan: int,
+    max_num_sciencetargets: int = 30,
+    max_sum_nchan: int = 960,
+) -> str | None:
     if nfields > max_num_sciencetargets and sum_nchan > max_sum_nchan:
-        return ("The number of science targets is > %d and the total number of spectral "
-                "channels across all science spws > %d. The imaging pipeline will take "
-                "substantial time to run on this MOUS." % (max_num_sciencetargets, max_sum_nchan))
+        return (
+            "The number of science targets is > %d and the total number of spectral "
+            "channels across all science spws > %d. The imaging pipeline will take "
+            "substantial time to run on this MOUS."
+            % (max_num_sciencetargets, max_sum_nchan)
+        )
     return None
 
 
@@ -603,27 +682,64 @@ def step4_runtime_warning(nfields: int, sum_nchan: int,
 # Orchestration
 # =============================================================================
 
-def plan(table: pd.DataFrame, limits: Limits, cube_sizes: dict, product_sizes: dict,
-         repr_spw: str, nfields: int = 1, fields_product_sizes: dict | None = None,
-         repr_field: str | None = None, sum_nchan: int | None = None):
+
+def plan(
+    table: pd.DataFrame,
+    limits: Limits,
+    cube_sizes: dict,
+    product_sizes: dict,
+    repr_spw: str,
+    nfields: int = 1,
+    fields_product_sizes: dict | None = None,
+    repr_field: str | None = None,
+    sum_nchan: int | None = None,
+):
+
+    if fields_product_sizes is not None and len(fields_product_sizes) != nfields:
+        raise ValueError(
+            f"nfields={nfields} but fields_product_sizes has "
+            f"{len(fields_product_sizes)} entries"
+        )
+
+    # nfields is one MOUS-wide count, applied to every spw (overrides any
+    # nfields the table was built with).
+    table = add_nfields_columns(table, nfields)
 
     # Step 1
-    table = add_size_and_step_columns(table, cube_sizes, product_sizes, limits.maxcubesize)
+    table = add_size_and_step_columns(
+        table, cube_sizes, product_sizes, limits.maxcubesize
+    )
     print("-- after Step 1 (per-spw cube mitigation) --")
-    print(table[["min_steps", "levers_used", "achieved_reduction",
-                  "mitigated_cube_GB", "mitigated_product_GB"]].round(3).to_string())
+    print(
+        table[
+            [
+                "min_steps",
+                "levers_used",
+                "achieved_reduction",
+                "mitigated_cube_GB",
+                "mitigated_product_GB",
+            ]
+        ]
+        .round(3)
+        .to_string()
+    )
 
     # Step 2a: field reduction
     kept_fields = None
     aggregate_for_check = table["mitigated_product_GB"].sum()
     if nfields > 1:
         if fields_product_sizes is None or repr_field is None:
-            raise ValueError("fields_product_sizes and repr_field are required when nfields > 1")
+            raise ValueError(
+                "fields_product_sizes and repr_field are required when nfields > 1"
+            )
         kept_fields, field_total, n_dropped, formula_achieved = step2_field_reduction(
-            fields_product_sizes, repr_field, limits.maxproductsize)
-        print(f"\n-- Step 2a: field reduction -- dropped {n_dropped} field(s) "
-              f"(formula target {formula_achieved:.3f}), kept {kept_fields} "
-              f"(product size {field_total:.2f} GB)")
+            fields_product_sizes, repr_field, limits.maxproductsize
+        )
+        print(
+            f"\n-- Step 2a: field reduction -- dropped {n_dropped} field(s) "
+            f"(formula target {formula_achieved:.3f}), kept {kept_fields} "
+            f"(product size {field_total:.2f} GB)"
+        )
         aggregate_for_check = field_total
 
         # Fold the outcome into the spw table's own bookkeeping, so
@@ -631,8 +747,19 @@ def plan(table: pd.DataFrame, limits: Limits, cube_sizes: dict, product_sizes: d
         # for every affected spw, exactly like n_bin does when chosen.
         if n_dropped > 0:
             table = apply_field_reduction_to_table(table, n_dropped)
-            print(table[["min_steps", "levers_used", "achieved_reduction",
-                          "mitigated_cube_GB", "mitigated_product_GB"]].round(3).to_string())
+            print(
+                table[
+                    [
+                        "min_steps",
+                        "levers_used",
+                        "achieved_reduction",
+                        "mitigated_cube_GB",
+                        "mitigated_product_GB",
+                    ]
+                ]
+                .round(3)
+                .to_string()
+            )
         # KNOWN GAP: the spws belonging to dropped fields are not removed
         # from `table` -- every spw still contributes its (now field-
         # mitigated) product size below, so Step 2b (if it still runs)
@@ -645,20 +772,46 @@ def plan(table: pd.DataFrame, limits: Limits, cube_sizes: dict, product_sizes: d
     # Step 2b: global lever escalation, if the aggregate is still over
     # budget after field reduction (or if there was only one field)
     if limits.maxproductsize != -1 and aggregate_for_check > limits.maxproductsize:
-        print(f"\n-- Step 2b: global lever escalation -- "
-              f"{aggregate_for_check:.2f} GB > budget {limits.maxproductsize} GB")
+        print(
+            f"\n-- Step 2b: global lever escalation -- "
+            f"{aggregate_for_check:.2f} GB > budget {limits.maxproductsize} GB"
+        )
         table = step2_global_escalation(table, limits.maxproductsize)
-        print(table[["min_steps", "levers_used", "achieved_reduction",
-                      "mitigated_cube_GB", "mitigated_product_GB"]].round(3).to_string())
+        print(
+            table[
+                [
+                    "min_steps",
+                    "levers_used",
+                    "achieved_reduction",
+                    "mitigated_cube_GB",
+                    "mitigated_product_GB",
+                ]
+            ]
+            .round(3)
+            .to_string()
+        )
 
     # Step 3
     selected, msg = step3_select_spws(table, limits, repr_spw)
     print(f"\n-- Step 3: spw selection -- {msg['shortmsg']}")
     if selected is None:
         return None, msg
-    print(selected[["min_steps", "levers_used", "achieved_reduction",
-                     "mitigated_cube_GB", "mitigated_product_GB"]].round(3).to_string())
-    print(f"Total selected product size: {selected['mitigated_product_GB'].sum():.2f} GB")
+    print(
+        selected[
+            [
+                "min_steps",
+                "levers_used",
+                "achieved_reduction",
+                "mitigated_cube_GB",
+                "mitigated_product_GB",
+            ]
+        ]
+        .round(3)
+        .to_string()
+    )
+    print(
+        f"Total selected product size: {selected['mitigated_product_GB'].sum():.2f} GB"
+    )
 
     # Step 4
     if sum_nchan is not None:
@@ -674,17 +827,45 @@ def plan(table: pd.DataFrame, limits: Limits, cube_sizes: dict, product_sizes: d
 # =============================================================================
 
 if __name__ == "__main__":
-    # Single-field MOUS for this example, so each spw's own "nfields" is 1
-    # (matches the plan(nfields=1) call below).
+    # Single-field MOUS for this example: nfields=1 is passed once, to
+    # plan(), for the whole MOUS (not per spw).
     example_spws = [
-        {"spw": "16 (repr.)", "nchan": 3840, "ratio_satisfied": False,
-         "pb": 0.9, "is_mosaic": False, "ppb": 4.0, "robust": 2.0, "nfields": 1},
-        {"spw": "18", "nchan": 960, "ratio_satisfied": True,
-         "pb": 1.0, "is_mosaic": False, "ppb": 3.5, "robust": None, "nfields": 1},
-        {"spw": "20", "nchan": 7680, "ratio_satisfied": False,
-         "pb": 0.6, "is_mosaic": True, "ppb": 3.0, "robust": None, "nfields": 1},
-        {"spw": "22", "nchan": 1920, "ratio_satisfied": False,
-         "pb": 0.65, "is_mosaic": False, "ppb": 5.0, "robust": 2.0, "nfields": 1},
+        {
+            "spw": "16 (repr.)",
+            "nchan": 3840,
+            "ratio_satisfied": False,
+            "pb": 0.9,
+            "is_mosaic": False,
+            "ppb": 4.0,
+            "robust": 2.0,
+        },
+        {
+            "spw": "18",
+            "nchan": 960,
+            "ratio_satisfied": True,
+            "pb": 1.0,
+            "is_mosaic": False,
+            "ppb": 3.5,
+            "robust": None,
+        },
+        {
+            "spw": "20",
+            "nchan": 7680,
+            "ratio_satisfied": False,
+            "pb": 0.6,
+            "is_mosaic": True,
+            "ppb": 3.0,
+            "robust": None,
+        },
+        {
+            "spw": "22",
+            "nchan": 1920,
+            "ratio_satisfied": False,
+            "pb": 0.65,
+            "is_mosaic": False,
+            "ppb": 5.0,
+            "robust": 2.0,
+        },
     ]
 
     # ROI is off by default (build_mitigation_table(..., use_roi=True) to
@@ -699,16 +880,49 @@ if __name__ == "__main__":
     # Sizes come from calculate_sizes() on an imlist (in the real pipeline
     # this is makeimlist's target list; here: one field, one target per spw).
     example_imlist = [
-        {"field": "f1", "spw": "16 (repr.)", "imsize": (2550, 2550), "nbin": -1, "specmode": "cube"},
-        {"field": "f1", "spw": "18",         "imsize": (2200, 2200), "nbin": -1, "specmode": "cube"},
-        {"field": "f1", "spw": "20",         "imsize": (1340, 1340), "nbin": -1, "specmode": "cube"},
-        {"field": "f1", "spw": "22",         "imsize": (2420, 2420), "nbin": -1, "specmode": "cube"},
+        {
+            "field": "f1",
+            "spw": "16 (repr.)",
+            "imsize": (2550, 2550),
+            "nbin": -1,
+            "specmode": "cube",
+        },
+        {
+            "field": "f1",
+            "spw": "18",
+            "imsize": (2200, 2200),
+            "nbin": -1,
+            "specmode": "cube",
+        },
+        {
+            "field": "f1",
+            "spw": "20",
+            "imsize": (1340, 1340),
+            "nbin": -1,
+            "specmode": "cube",
+        },
+        {
+            "field": "f1",
+            "spw": "22",
+            "imsize": (2420, 2420),
+            "nbin": -1,
+            "specmode": "cube",
+        },
     ]
     nchan_by_spw = {r["spw"]: r["nchan"] for r in example_spws}
     cube_sizes, max_cube, product_sizes, total_product = calculate_sizes(
-        example_imlist, nchan_by_spw.__getitem__)
-    print(f"calculate_sizes: max cube {max_cube:.1f} GB, total product {total_product:.1f} GB")
+        example_imlist, nchan_by_spw.__getitem__
+    )
+    print(
+        f"calculate_sizes: max cube {max_cube:.1f} GB, total product {total_product:.1f} GB"
+    )
 
-    selected, msg = plan(table, limits, cube_sizes, product_sizes,
-                          repr_spw="16 (repr.)", nfields=1,
-                          sum_nchan=sum(r["nchan"] for r in example_spws))
+    selected, msg = plan(
+        table,
+        limits,
+        cube_sizes,
+        product_sizes,
+        repr_spw="16 (repr.)",
+        nfields=1,
+        sum_nchan=sum(r["nchan"] for r in example_spws),
+    )
