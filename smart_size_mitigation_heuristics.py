@@ -238,6 +238,22 @@ def mitigation_fields(n_fields_total: int, n_fields_kept: int) -> float:
     return (n_fields_total - n_fields_kept) / n_fields_total
 
 
+def mitigation_spws(n_spws_total: int, n_spws_removed: int) -> float:
+    """Spectral-window removal (aggregate product size -- not a per-spw cube
+    lever). Assumes every spw contributes an equal share of the total
+    product size, so the fractional reduction is the fraction of spws
+    removed: removing 4 of 5 spws removes 4/5 = 0.8 of the size. (The
+    planner uses the actual per-spw sizes; this is the idealised curve.)
+
+    n_spws_removed runs from 0 to n_spws_total - 1: the representative spw
+    is always kept."""
+    if n_spws_total <= 0:
+        raise ValueError("n_spws_total must be positive")
+    if not (0 <= n_spws_removed <= n_spws_total - 1):
+        raise ValueError("n_spws_removed must be between 0 and n_spws_total - 1")
+    return n_spws_removed / n_spws_total
+
+
 def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
     """Fewest fields to remove for a required product reduction. There is
     no menu of levers to choose from here -- mitigation_fields() is a
