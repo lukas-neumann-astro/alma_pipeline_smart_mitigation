@@ -11,17 +11,18 @@ rated with a single QUALITY SCORE between 0 and 1:
     else the more (and the more drastic) mitigation was needed, the lower
 
 Every lever returns its own score, and the final score is their product.
-The levers, from most to least moderate (see the score_* functions):
+A lever's score comes from the SIZE it removes (the same mitigation_*
+functions that give the size reductions):
 
-    n_bin, PB, cell   reduce the data quality but remove nothing: 0.9 for
-                      n_bin; between 0.9 and 1.0 for PB and cell, the less
-                      they change the original values, the closer to 1
-    ROI               0.5 to 1.0: 1 if the ROI is the whole spw, down to 0.5
-                      when almost everything is cut away
-    removing spws     0.4 to 0.6, lower the more spws are removed (the
-                      representative spw is always kept)
-    removing fields   0.2 to 0.4, lower the more fields are removed (the
-                      representative field is always kept)
+    score = (1 - reduction) ** (1 / weight)       see lever_score()
+
+i.e. the fraction of the size that is left, softened by the lever's weight.
+The weights (LEVER_WEIGHTS, or plan(..., weights={...})) are the priorities
+of the levers: the higher the weight, the milder the penalty and the more
+the lever is preferred. By default n_bin, PB and cell (they only reduce
+the data quality) have high weights; ROI, removing spws and removing
+fields (data is lost) have lower ones. Changing the priorities means
+changing these numbers, nothing else.
 
 How the plan is chosen (enumerate_plans() / plan()):
 
@@ -75,6 +76,9 @@ KNOWN SIMPLIFICATIONS (worth resolving before this governs real imaging runs):
     which n_bin does not affect).
   - The score of n_bin/PB/cell/ROI over the MOUS is the plain mean over the
     kept spws of the per-spw scores (not weighted by size).
+  - The spw lever's reduction is the share of the baseline product size that
+    sits in the removed spws; the field lever's reduction assumes equal-sized
+    fields (mitigation_fields()).
 """
 
 import itertools
@@ -272,75 +276,61 @@ def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
 
 
 # =============================================================================
-# Quality scores: how much a mitigation hurts (1 = not at all, 0 = worst)
+# Lever scores: how much a mitigation costs (1 = nothing, towards 0 = a lot)
 # =============================================================================
 
-SCORE_NBIN = 0.9  # channel binning, when applied
-SCORE_MIN_PB_CELL = 0.9  # PB / cell at a mitigation of 100 % (never reached)
-SCORE_MIN_ROI = 0.5  # ROI that cuts away (almost) the whole spw
-SCORE_RANGE_SPWS = (
-    0.4,
-    0.6,
-)  # (worst, best): all but the repr. spw / almost none removed
-SCORE_RANGE_FIELDS = (
-    0.2,
-    0.4,
-)  # (worst, best): all but the repr. field / almost none removed
+# How readily each lever may be used: the HIGHER the weight, the cheaper the
+# lever (the milder its penalty), so the more the planner prefers it. This is
+# the one place to change the priorities of the mitigation levers.
+LEVER_WEIGHTS = {
+    "n_bin": 1,  # moderate: only the data quality suffers
+    "PB": 1,  # moderate
+    "cell": 1,  # moderate
+    "ROI": 0.2,  # a part of the spw is lost
+    "spws": 0.1,  # whole spws are lost
+    "fields": 0.01,  # whole fields are lost
+}
 
 
-def score_nbin() -> float:
-    """Channel binning: a fixed 0.9 whenever it is applied."""
-    return SCORE_NBIN
+def lever_score(reduction: float, weight: float) -> float:
+    """Score of one lever from the size reduction it delivers:
+
+        score = (1 - reduction) * weight
+
+    `reduction` is the fraction of the size removed (the output of the
+    mitigation_* functions); 1 - reduction is what is left. With weight 1
+    the score is simply the fraction of the size that is left, so a
+    mitigation that removes 80 % scores 0.2. A smaller weight sharpens the
+    penalty (weight 0.1: 0.2 * 0.1 = 0.02), a larger one softens it."""
+    if not -1e-9 <= reduction <= 1.0 + 1e-9:
+        raise ValueError("reduction must be between 0 and 1")
+    reduction = min(max(reduction, 0.0), 1.0)  # rounding noise
+    if weight <= 0:
+        raise ValueError("weight must be positive")
+    return (1.0 - reduction) *  weight
 
 
-def score_pb(mitigation: float) -> float:
-    """PB (FoV) tightening: 0.9 to 1.0, the closer to 1 the less the FoV
-    changes. `mitigation` is the size reduction from mitigation_pb()."""
-    return 1.0 - (1.0 - SCORE_MIN_PB_CELL) * mitigation
+def _weights(weights: dict | None) -> dict:
+    """LEVER_WEIGHTS, with any entries of `weights` overriding the defaults."""
+    merged = dict(LEVER_WEIGHTS)
+    if weights:
+        unknown = set(weights) - set(merged)
+        if unknown:
+            raise ValueError(f"unknown lever(s) in weights: {sorted(unknown)}")
+        merged.update(weights)
+    return merged
 
 
-def score_cell(mitigation: float) -> float:
-    """Cell size (hm_cell) increase: 0.9 to 1.0, like score_pb()."""
-    return 1.0 - (1.0 - SCORE_MIN_PB_CELL) * mitigation
-
-
-def score_roi(mitigation: float) -> float:
-    """ROI: 1.0 for the whole spw (mitigation 0), falling linearly to 0.5
-    when everything is cut away (mitigation 1). `mitigation` is
-    mitigation_roi(), the removed fraction."""
-    return 1.0 - (1.0 - SCORE_MIN_ROI) * mitigation
-
-
-def _removal_score(n_total: int, n_removed: int, score_range: tuple) -> float:
-    worst, best = score_range
-    max_removable = n_total - 1  # the representative one always stays
-    if n_removed <= 0 or max_removable <= 0:
-        return 1.0
-    n_removed = min(n_removed, max_removable)
-    return best - (best - worst) * n_removed / max_removable
-
-
-def score_spws(n_total: int, n_removed: int) -> float:
-    """Removing spws: 1.0 if none; otherwise 0.6 (almost none removed)
-    falling linearly to 0.4 (all but the representative spw removed)."""
-    return _removal_score(n_total, n_removed, SCORE_RANGE_SPWS)
-
-
-def score_fields(n_total: int, n_removed: int) -> float:
-    """Removing fields: 1.0 if none; otherwise 0.4 (almost none removed)
-    falling linearly to 0.2 (all but the representative field removed)."""
-    return _removal_score(n_total, n_removed, SCORE_RANGE_FIELDS)
-
-
-def cube_lever_qualities(table: pd.DataFrame) -> pd.DataFrame:
+def cube_lever_qualities(
+    table: pd.DataFrame, weights: dict | None = None
+) -> pd.DataFrame:
     """Score each cube lever WOULD have if applied to each spw (rows: spws,
-    columns: CUBE_LEVER_COLUMNS). Levers that cannot be applied (value 0)
-    get 1.0."""
+    columns: CUBE_LEVER_COLUMNS), from the lever's size reduction in the
+    table. Levers that cannot be applied (reduction 0) score 1.0."""
+    w = _weights(weights)
     q = pd.DataFrame(index=table.index)
-    q["n_bin"] = [SCORE_NBIN if m > 0 else 1.0 for m in table["n_bin"]]
-    q["PB"] = [score_pb(m) for m in table["PB"]]
-    q["cell"] = [score_cell(m) for m in table["cell"]]
-    q["ROI"] = [score_roi(m) for m in table["ROI"]]
+    for lever in CUBE_LEVER_COLUMNS:
+        q[lever] = [lever_score(r, w[lever]) for r in table[lever]]
     return q
 
 
@@ -574,6 +564,7 @@ def enumerate_plans(
     nfields: int = 1,
     prune: bool = True,
     max_candidates: int = 1_000_000,
+    weights: dict | None = None,
 ) -> pd.DataFrame:
     """Every plan -- a choice of cube levers per kept spw, of which spws to
     keep (the representative one always is) and of how many fields to keep
@@ -591,12 +582,17 @@ def enumerate_plans(
       score           their product, or 0 if not feasible
     Sorted by score (best first), then fewer levers, then smaller product.
 
+    weights: overrides of LEVER_WEIGHTS (keys: n_bin, PB, cell, ROI, spws,
+    fields) -- the priorities of the levers.
+
     prune: leave out cube-lever combinations that can never be part of a
     better plan (see _spw_options); False lists literally every one.
     The number of plans grows quickly with the number of spws, so more than
     max_candidates raises an error."""
     spws = [repr_spw] + [s for s in table.index if s != repr_spw]
-    qualities = cube_lever_qualities(table)
+    w = _weights(weights)
+    qualities = cube_lever_qualities(table, w)
+    total_product = table["product_size_GB"].sum()
     options = {s: _spw_options(table.loc[s], qualities.loc[s], prune) for s in spws}
 
     n_plans = nfields * len(options[repr_spw])
@@ -632,13 +628,20 @@ def enumerate_plans(
                 sum(o["q"][i] for o in combo) / len(kept)
                 for i in range(len(CUBE_LEVER_COLUMNS))
             ]
-            spw_score = score_spws(n_spw, n_spw - len(kept))
+            # the size share removed with the dropped spws (the equal-size
+            # special case is mitigation_spws())
+            kept_share = (
+                sum(table.at[s, "product_size_GB"] for s in kept) / total_product
+            )
+            spw_score = lever_score(1.0 - kept_share, w["spws"])
             levers = {s: ",".join(o["levers"]) or "-" for s, o in zip(kept, combo)}
             n_levers = sum(len(o["levers"]) for o in combo)
             for n_kept in range(1, nfields + 1):
                 product = product0 * n_kept / nfields
                 feasible = cube_ok and (budget == -1 or product <= budget + 1e-9)
-                field_score = score_fields(nfields, nfields - n_kept)
+                field_score = lever_score(
+                    mitigation_fields(nfields, n_kept), w["fields"]
+                )
                 score = math.prod(lever_scores) * spw_score * field_score
                 rows.append(
                     [levers.get(s, "dropped") for s in spws]
@@ -761,6 +764,7 @@ def plan(
     nfields: int | None = None,
     return_candidates: bool = False,
     prune: bool = True,
+    weights: dict | None = None,
 ):
     """Returns (final_table, msg).
 
@@ -780,6 +784,8 @@ def plan(
                  also return the list of ALL plans, best first, in
                  msg['candidates'] (see enumerate_plans()).
       prune      passed to enumerate_plans().
+      weights    overrides of LEVER_WEIGHTS, the priorities of the levers
+                 (higher weight = lever preferred), e.g. {'spws': 5}.
 
     The spws in `table` must be the spws of imlist.
 
@@ -812,7 +818,7 @@ def plan(
     table = add_size_columns(
         table, cube_sizes, product_sizes, limits.maxcubesize, limits.maxcubelimit
     )
-    plans = enumerate_plans(table, limits, repr_spw, nfields, prune)
+    plans = enumerate_plans(table, limits, repr_spw, nfields, prune, weights=weights)
     best = plans.iloc[0]
 
     if best["feasible"]:
