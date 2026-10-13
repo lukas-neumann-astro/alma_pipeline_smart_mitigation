@@ -1,56 +1,57 @@
 """
-Score-based size mitigation planner for the ALMA pipeline's
-checkproductsize.py, combining:
+Score-based size mitigation for the ALMA pipeline's checkproductsize.py.
 
-  - the per-lever mitigation formulas and table builder
-    (formerly mitigation_table.py)
-  - the four-step planner that uses them
-    (formerly smart_size_mitigation.py)
+Instead of the original try -> recompute -> test cascade (nbin, then FoV,
+then cell size, then fields, then spws), the mitigation is worked out in
+ONE pass from a table of what each lever could achieve:
 
-into one module, following the four-step structure of the original
-mitigate_sizes()/mitigate_imsize() logic:
+  1. POTENTIAL   Every lever's possible size reduction is computed up front
+                 (mitigation_nbin/pb/cell/roi/fields) and collected in one
+                 table, one row per spw, one column per lever.
+  2. SCORES      A lever's score is its mitigation value (higher = better).
+                 For the aggregate product budget, the per-lever score is
+                 the product-size-weighted mean over the spws (lever_scores).
+  3. SOLVE       Levers are picked in score order, only as many as needed:
+                   - per spw, the cube levers (n_bin, PB, cell, ROI) needed
+                     to reach maxcubesize;
+                   - then, if the summed product size is still above
+                     maxproductsize, the levers are walked down the global
+                     score ranking (nfields included) until the budget fits.
+  4. SELECT      Only if mitigation alone cannot meet the limits, spws are
+                 dropped (representative spw always kept), gated by
+                 maxcubelimit and maxproductsize.
 
-  Step 1 - per-spw cube size mitigation, gated by maxcubesize (soft).
-  Step 2 - aggregate product size mitigation, gated by maxproductsize:
-           (a) field reduction, if there is more than one science target
-           (b) further GLOBAL lever escalation, if still over budget
-               (or if there was only one field to begin with)
-  Step 3 - spw selection/filtering, gated by maxcubelimit (hard) and
-           maxproductsize (budget) -- this is where a spw actually gets
-           dropped, as opposed to Step 1/2 which only shrink cubes.
-  Step 4 - large-MOUS runtime warning (unchanged from the original,
-           not a mitigation step at all).
+The result is a single table (plan()) with one row per spw: the lever
+values, which levers were applied, the achieved reduction, the mitigated
+cube/product sizes and whether the spw is kept.
 
-Limits map onto this structure the same way they did in the original
-code:
+Limits:
 
-  maxcubesize    -> Step 1 only.    Soft: never causes a spw to be
-                                     dropped by itself.
-  maxproductsize -> Step 2 and 3.   Soft target in Step 2 (more
-                                     mitigation is tried), hard budget
-                                     in Step 3 (spws get dropped to fit).
-  maxcubelimit   -> Step 3 only.    Hard: a non-representative spw over
-                                     this limit is excluded outright; the
-                                     representative spw over this limit
-                                     is an unrecoverable failure.
+  maxcubesize    -> per-spw cube target. Soft: never drops a spw by itself.
+  maxproductsize -> aggregate product target; mitigation tries to meet it,
+                    and spw selection enforces it as a hard budget.
+  maxcubelimit   -> per-spw hard gate in the selection: a non-representative
+                    spw over this limit is excluded; the representative spw
+                    over this limit is an unrecoverable failure.
 
-KNOWN SIMPLIFICATIONS (carried over from earlier in this design, and
-worth resolving before this governs real imaging runs):
-  - The PB/cell formulas here use a simplified "floor" framing, not the
-    original code's empirical exp() formula. In particular, the original
-    code carries the PB value Step 1 converged on into Step 2 as a new
-    starting floor (PB_mitigation = max(PB_mitigation, PB_limit)) --
-    i.e. Step 2 is never allowed to *relax* FoV mitigation below what
-    Step 1 already committed to. This planner does not yet model that
-    carry-over explicitly; it only tracks *which* levers were used per
-    spw, not the specific parameter value each lever converged to.
-  - Step 2's field reduction (step2_field_reduction) only reports which
-    fields would be kept; the spws belonging to dropped fields are not
-    removed from the spw-level table the way a real makeimlist recompute
-    would (see apply_field_reduction_to_table()'s docstring).
-  - achieved_reduction is applied equally to product_size as to
-    cube_size (product size also includes the mfs-image term, which
-    n_bin does not affect).
+nfields is a single, MOUS-wide count (all spws are imaged across the same
+fields). It is a PRODUCT-size lever only: dropping fields shrinks the total
+product size but not the size of any individual cube, so it never counts
+towards maxcubesize. product_sizes[spw] is the product size of that spw
+summed over all fields; keeping k of N fields scales it by k/N (equal-sized
+fields assumed, the representative field always kept).
+
+KNOWN SIMPLIFICATIONS (worth resolving before this governs real imaging runs):
+  - The PB/cell formulas use a simplified "floor" framing, not the original
+    code's empirical exp() formula, and the original's carry-over of the
+    converged PB value between steps (PB_mitigation = max(PB_mitigation,
+    PB_limit)) is not modelled: only WHICH levers are used per spw is
+    tracked, not the parameter value each lever converges to.
+  - Levers are assumed to compound independently (1 - prod(1 - r_i)); n_bin
+    and ROI both act on the spectral axis, so this may not hold.
+  - The reduction of the cube-level levers is applied equally to the product
+    size and the cube size (the product size also contains the MFS term,
+    which n_bin does not affect).
 """
 
 import math
@@ -119,19 +120,6 @@ def calculate_sizes(
         total_productsize += productsize
 
     return cubesizes, max(cubesizes.values()), productsizes, total_productsize
-
-
-def field_product_sizes(
-    imlist: list[dict], get_nchan: Callable[[str], int], full_pol: bool = False
-) -> dict:
-    """Per-field total product size (sum over that field's spws), computed
-    with calculate_sizes() on each field's targets. This is the
-    fields_product_sizes input of plan()/step2_field_reduction()."""
-    out = {}
-    for field in dict.fromkeys(t["field"] for t in imlist):
-        targets = [t for t in imlist if t["field"] == field]
-        out[field] = calculate_sizes(targets, get_nchan, full_pol)[3]
-    return out
 
 
 # =============================================================================
@@ -222,7 +210,10 @@ def minimum_fields_to_remove(n_fields_total: int, required_reduction: float):
 # Mitigation table builder
 # =============================================================================
 
-LEVER_COLUMNS = ["n_bin", "PB", "cell", "ROI", "nfields"]
+# Levers that shrink an individual cube (and therefore also the products).
+CUBE_LEVER_COLUMNS = ["n_bin", "PB", "cell", "ROI"]
+# All levers. nfields is the odd one out: it only shrinks the product total.
+LEVER_COLUMNS = CUBE_LEVER_COLUMNS + ["nfields"]
 
 
 def total_reduction(row: pd.Series, columns: list[str] = LEVER_COLUMNS) -> float:
@@ -281,24 +272,44 @@ def minimum_steps_to_target(lever_values: dict, required_reduction: float):
     return len(used), 1.0 - remaining, used
 
 
+def _refresh_sizes(table: pd.DataFrame) -> pd.DataFrame:
+    """Recomputes the mitigated sizes from the cube-lever reduction
+    (achieved_reduction, hits cube AND product) and the field reduction
+    (field_reduction, hits the product only)."""
+    table["mitigated_cube_GB"] = table["cube_size_GB"] * (
+        1 - table["achieved_reduction"]
+    )
+    table["mitigated_product_GB"] = (
+        table["product_size_GB"]
+        * (1 - table["achieved_reduction"])
+        * (1 - table["field_reduction"])
+    )
+    return table
+
+
 def add_size_and_step_columns(
     table: pd.DataFrame,
     cube_sizes: dict,
     product_sizes: dict,
     maxcubesize: float,
-    columns: list[str] = LEVER_COLUMNS,
+    columns: list[str] = CUBE_LEVER_COLUMNS,
 ) -> pd.DataFrame:
     """Extends the lever table with, per spw:
         cube_size_GB, product_size_GB   -- baseline predicted sizes
         required_reduction              -- 0 if already within maxcubesize,
                                             else 1 - maxcubesize/cube_size
         min_steps, levers_used          -- from minimum_steps_to_target()
-        achieved_reduction              -- reduction actually reached with
-                                            those steps (>= required_reduction
-                                            unless even all levers fall short)
+        achieved_reduction              -- cube-lever reduction actually
+                                            reached with those steps (>=
+                                            required_reduction unless even
+                                            all levers fall short)
+        field_reduction                 -- product-only reduction from
+                                            dropping fields (0 until applied)
         mitigated_cube_GB, mitigated_product_GB
-                                         -- baseline sizes scaled by
-                                            (1 - achieved_reduction)
+                                         -- see _refresh_sizes()
+
+    `columns` are the levers that may be used to reach maxcubesize. nfields
+    is deliberately not one of them (see the module docstring).
 
     NOTE: achieved_reduction is applied to product_size_GB as well as
     cube_size_GB, i.e. assuming the product size scales down by the same
@@ -308,9 +319,12 @@ def add_size_and_step_columns(
     table = table.copy()
     table["cube_size_GB"] = [cube_sizes[spw] for spw in table.index]
     table["product_size_GB"] = [product_sizes[spw] for spw in table.index]
-    table["required_reduction"] = table.apply(
-        lambda r: max(0.0, 1.0 - maxcubesize / r["cube_size_GB"]), axis=1
-    )
+    if maxcubesize == -1:  # -1 = no limit (as in the pipeline inputs)
+        table["required_reduction"] = 0.0
+    else:
+        table["required_reduction"] = table.apply(
+            lambda r: max(0.0, 1.0 - maxcubesize / r["cube_size_GB"]), axis=1
+        )
 
     steps, achieved, used = [], [], []
     for spw, row in table.iterrows():
@@ -322,14 +336,8 @@ def add_size_and_step_columns(
     table["min_steps"] = steps
     table["levers_used"] = used
     table["achieved_reduction"] = achieved
-
-    table["mitigated_cube_GB"] = table["cube_size_GB"] * (
-        1 - table["achieved_reduction"]
-    )
-    table["mitigated_product_GB"] = table["product_size_GB"] * (
-        1 - table["achieved_reduction"]
-    )
-    return table
+    table["field_reduction"] = 0.0
+    return _refresh_sizes(table)
 
 
 def add_nfields_columns(table: pd.DataFrame, nfields: int) -> pd.DataFrame:
@@ -349,6 +357,7 @@ def add_nfields_columns(table: pd.DataFrame, nfields: int) -> pd.DataFrame:
         raise ValueError("nfields must be >= 1")
     table = table.copy()
     table["nfields_total"] = nfields
+    table["nfields_kept"] = nfields
     table["nfields"] = mitigation_fields(nfields, 1)
     table["total_reduction"] = table.apply(total_reduction, axis=1)
     return table
@@ -381,23 +390,13 @@ def build_mitigation_table(
     that counts; passing it here only makes the raw table show the nfields
     column. See add_nfields_columns() for what the column holds.
 
-    'nfields' is included in LEVER_COLUMNS, so it is treated exactly like
-    n_bin/PB/cell/ROI everywhere that reads that list: Step 1's own
-    per-spw search (minimum_steps_to_target) may pick it to meet
-    maxcubesize, and Step 2b's global escalation may pick it to meet
-    maxproductsize, both using the theoretical-max value -- in addition
-    to it being overwritten with the real achieved value once Step 2a's
-    field_reduction formula runs (apply_field_reduction_to_table()).
-
-    NOTE: this means Step 1/2b can report a spw as already "mitigated via
-    nfields" purely on the theoretical-max value, independently of
-    whatever Step 2a later actually decides for the aggregate field count
-    -- the two are not reconciled. Step 2a's own field_reduction() is
-    unaffected (it always runs off the real aggregate product-size budget
-    and per-field sizes), so the final, authoritative field count still
-    comes from Step 2a; Step 1/2b's use of 'nfields' is best read as "this
-    spw could be fully covered by dropping fields alone", not as a
-    decision actually taken yet."""
+    'nfields' is part of LEVER_COLUMNS, so it takes part in the lever scoring
+    and in total_reduction (the POTENTIAL total over all levers). Unlike the
+    other levers it only shrinks the product total, never a single cube, so
+    the per-spw cube search ignores it (CUBE_LEVER_COLUMNS); plan() decides
+    how many fields to drop and writes the achieved value into the
+    'nfields' column.
+    """
     records = []
     for row in spw_rows:
         roi_value = mitigation_roi(row["n_roi"], row["n_total"]) if use_roi else 0.0
@@ -429,157 +428,115 @@ class Limits:
 
 
 # =============================================================================
-# Step 2a: field reduction (only relevant when nfields > 1)
+# Scores: how much each lever can deliver, for the aggregate product budget
 # =============================================================================
 
 
-def step2_field_reduction(
-    fields_product_sizes: dict, repr_field: str, maxproductsize: float
-):
-    """Uses mitigation_fields()/minimum_fields_to_remove() to decide HOW
-    MANY fields must be dropped (the uniform-size approximation), then
-    uses the actual per-field product sizes to decide WHICH non-
-    representative fields to drop: largest-first.
+def lever_scores(
+    table: pd.DataFrame, product_sizes: dict, columns: list[str] = LEVER_COLUMNS
+) -> pd.Series:
+    """Score of each lever = its mitigation value averaged over the spws,
+    weighted by product size (a lever that is strong where the bytes are
+    scores higher). Higher is better. For nfields, which has the same
+    value in every row, the score is simply its mitigation value.
 
-    Dropping the largest fields first is the field-level analogue of
-    "apply the highest-mitigation-value lever first" used throughout the
-    rest of this planner -- it gets the real (non-uniform) achieved
-    reduction to match or exceed the formula's target using no more than
-    the formula's predicted field count, rather than, say, dropping
-    smallest-first (which would maximize the number of fields kept but
-    could require dropping MORE fields than the formula predicted to hit
-    the same size target). Worth revisiting if the real priority is
-    "keep as many fields as possible" rather than "drop as few as
-    possible" -- those are different objectives once field sizes aren't
-    actually uniform.
-
-    Returns (kept_fields, kept_total_GB, n_removed, formula_achieved)."""
-    total = sum(fields_product_sizes.values())
-    if maxproductsize == -1 or total <= maxproductsize:
-        return list(fields_product_sizes.keys()), total, 0, 0.0
-
-    n_total = len(fields_product_sizes)
-    required_reduction = 1.0 - maxproductsize / total
-    k, formula_achieved = minimum_fields_to_remove(n_total, required_reduction)
-
-    others_desc = sorted(
-        ((f, s) for f, s in fields_product_sizes.items() if f != repr_field),
-        key=lambda kv: kv[1],
-        reverse=True,
-    )
-    dropped = others_desc[:k]
-    kept = [repr_field] + [f for f, _ in others_desc[k:]]
-    kept_total = total - sum(s for _, s in dropped)
-    return kept, kept_total, k, formula_achieved
+    The scores are computed once, from the unmitigated table, and the
+    ranking they give is not recomputed along the way."""
+    weights = pd.Series({spw: product_sizes[spw] for spw in table.index})
+    weights = weights / weights.sum()
+    scores = {col: float((table[col] * weights).sum()) for col in columns}
+    return pd.Series(scores).sort_values(ascending=False)
 
 
 # =============================================================================
-# Step 2b: global lever escalation (applied uniformly across all spws,
-# ranked by aggregate GB saved)
+# Solving: apply as few levers as needed, best-scoring first
 # =============================================================================
 
 
-def _remaining_levers(levers_used: str, columns=LEVER_COLUMNS):
-    used = set(levers_used.split(",")) if levers_used != "-" else set()
-    return [c for c in columns if c not in used]
-
-
-def _apply_additional_lever(
-    table: pd.DataFrame, lever: str, columns=LEVER_COLUMNS
-) -> pd.DataFrame:
+def _apply_cube_lever(table: pd.DataFrame, lever: str) -> pd.DataFrame:
+    """Applies one more cube-level lever to every spw that can still use it
+    (value > 0 and not applied yet), compounding it into achieved_reduction."""
     table = table.copy()
     for idx, row in table.iterrows():
-        if lever not in _remaining_levers(row["levers_used"], columns):
+        used = (
+            set(row["levers_used"].split(",")) if row["levers_used"] != "-" else set()
+        )
+        if lever in used or row[lever] <= 0:
             continue
-        lever_val = row[lever]
-        if lever_val <= 0:
-            continue
-        new_remaining_frac = (1 - row["achieved_reduction"]) * (1 - lever_val)
-        table.at[idx, "achieved_reduction"] = 1 - new_remaining_frac
+        table.at[idx, "achieved_reduction"] = 1 - (1 - row["achieved_reduction"]) * (
+            1 - row[lever]
+        )
         table.at[idx, "levers_used"] = (
-            row["levers_used"] + "," + lever if row["levers_used"] != "-" else lever
+            lever if row["levers_used"] == "-" else row["levers_used"] + "," + lever
         )
         table.at[idx, "min_steps"] = row["min_steps"] + 1
-    table["mitigated_cube_GB"] = table["cube_size_GB"] * (
-        1 - table["achieved_reduction"]
-    )
-    table["mitigated_product_GB"] = table["product_size_GB"] * (
-        1 - table["achieved_reduction"]
-    )
-    return table
+    return _refresh_sizes(table)
 
 
-def step2_global_escalation(
+def _apply_fields(table: pd.DataFrame, n_fields: int, n_removed: int) -> pd.DataFrame:
+    """Drops n_removed of the n_fields fields (the representative field is
+    always among the kept ones). Product-size lever only: field_reduction
+    hits mitigated_product_GB, not mitigated_cube_GB. The 'nfields' column
+    changes from its theoretical maximum to the value actually achieved."""
+    table = table.copy()
+    reduction = mitigation_fields(n_fields, n_fields - n_removed)
+    table["nfields"] = reduction
+    table["field_reduction"] = reduction
+    table["nfields_kept"] = n_fields - n_removed
+    table["levers_used"] = [
+        "nfields" if used == "-" else used + ",nfields" for used in table["levers_used"]
+    ]
+    table["min_steps"] = table["min_steps"] + 1
+    return _refresh_sizes(table)
+
+
+def mitigate(
     table: pd.DataFrame,
-    maxproductsize: float,
-    columns=LEVER_COLUMNS,
-    max_iterations: int = 4,
-) -> pd.DataFrame:
-    """Repeatedly picks whichever UNUSED lever would save the most
-    aggregate GB across all spws that still have it available, applies it
-    to every such spw at once, and rechecks the aggregate budget. This is
-    the direct extension of "rank by mitigation value, higher is better"
-    to the aggregate/Step-2 problem, instead of the original code's fixed
-    nbin -> FoV -> cell sequence."""
-    table = table.copy()
-    for _ in range(max_iterations):
-        total = table["mitigated_product_GB"].sum()
-        if maxproductsize == -1 or total <= maxproductsize:
-            break
+    limits: Limits,
+    cube_sizes: dict,
+    product_sizes: dict,
+    nfields: int = 1,
+):
+    """Works out the mitigation in one pass. Returns (table, scores).
 
-        savings = {}
-        for lever in columns:
-            saved = 0.0
-            for _, row in table.iterrows():
-                if (
-                    lever in _remaining_levers(row["levers_used"], columns)
-                    and row[lever] > 0
-                ):
-                    current_remaining = row["product_size_GB"] * (
-                        1 - row["achieved_reduction"]
-                    )
-                    saved += current_remaining * row[lever]
-            if saved > 0:
-                savings[lever] = saved
+    1. Per spw, the fewest cube levers (best value first) that bring the
+       cube under limits.maxcubesize.
+    2. If the summed product size is still above limits.maxproductsize, the
+       levers are taken in global score order (lever_scores) until it fits.
+       nfields takes part in that ranking like any other lever; when it is
+       reached, only as many fields are dropped as the budget requires
+       (the representative field always stays). Cube levers are applied to
+       every spw that can still use them.
 
-        if not savings:
-            break  # no lever left that would help anywhere
+    Nothing is dropped here -- see select_spws() for that."""
+    table = add_nfields_columns(table, nfields)
+    scores = lever_scores(table, product_sizes)
+    table = add_size_and_step_columns(
+        table, cube_sizes, product_sizes, limits.maxcubesize
+    )
 
-        best_lever = max(savings, key=savings.get)
-        table = _apply_additional_lever(table, best_lever, columns)
-    return table
-
-
-def apply_field_reduction_to_table(table: pd.DataFrame, n_dropped: int) -> pd.DataFrame:
-    """Folds the OUTCOME of step2_field_reduction() into the spw-level
-    table's bookkeeping, the same way _apply_additional_lever() folds in a
-    chosen cube-level lever: updates 'nfields' from its theoretical-max
-    placeholder to the actual achieved value, appends 'nfields' to
-    levers_used, increments min_steps, compounds it into achieved_reduction,
-    and recomputes the mitigated sizes. After this, a spw whose fields got
-    cut shows 'nfields' in levers_used in the printed table exactly like
-    n_bin does when chosen.
-
-    nfields is a single MOUS-wide count (see add_nfields_columns()), so
-    n_dropped applies uniformly across all rows."""
-    if n_dropped <= 0:
-        return table
-
-    table = table.copy()
-    for idx, row in table.iterrows():
-        n_total = row["nfields_total"]
-        n_kept = max(1, n_total - n_dropped)
-        table.at[idx, "nfields"] = mitigation_fields(n_total, n_kept)
-    return _apply_additional_lever(table, "nfields", LEVER_COLUMNS)
+    if limits.maxproductsize != -1:
+        for lever, score in scores.items():
+            total = table["mitigated_product_GB"].sum()
+            if total <= limits.maxproductsize or score <= 0:
+                break
+            if lever == "nfields":
+                required = 1.0 - limits.maxproductsize / total
+                n_removed, _ = minimum_fields_to_remove(nfields, required)
+                if n_removed > 0:
+                    table = _apply_fields(table, nfields, n_removed)
+            else:
+                table = _apply_cube_lever(table, lever)
+    return table, scores
 
 
 # =============================================================================
-# Step 3: spw selection, gated by maxcubelimit (hard) and maxproductsize
-# (budget), operating on the POST mitigation sizes from steps 1 and 2
+# Selection: the only place where a spw can be dropped. Gated by maxcubelimit
+# (hard) and maxproductsize (budget), on the mitigated sizes.
 # =============================================================================
 
 
-def step3_select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
+def select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
     repr_row = table.loc[repr_spw]
     if (
         limits.maxcubelimit != -1
@@ -658,11 +615,11 @@ def step3_select_spws(table: pd.DataFrame, limits: Limits, repr_spw: str):
 
 
 # =============================================================================
-# Step 4: unchanged runtime warning
+# Runtime warning for large MOUS (not a mitigation)
 # =============================================================================
 
 
-def step4_runtime_warning(
+def runtime_warning(
     nfields: int,
     sum_nchan: int,
     max_num_sciencetargets: int = 30,
@@ -679,7 +636,7 @@ def step4_runtime_warning(
 
 
 # =============================================================================
-# Orchestration
+# plan(): the one-call entry point
 # =============================================================================
 
 
@@ -690,136 +647,30 @@ def plan(
     product_sizes: dict,
     repr_spw: str,
     nfields: int = 1,
-    fields_product_sizes: dict | None = None,
-    repr_field: str | None = None,
     sum_nchan: int | None = None,
 ):
+    """Returns (final_table, msg).
 
-    if fields_product_sizes is not None and len(fields_product_sizes) != nfields:
-        raise ValueError(
-            f"nfields={nfields} but fields_product_sizes has "
-            f"{len(fields_product_sizes)} entries"
-        )
+    final_table has one row per spw: the lever values (n_bin, PB, cell,
+    ROI, nfields), min_steps / levers_used / achieved_reduction (which
+    levers were applied), field_reduction, nfields_kept, the baseline and
+    mitigated cube and product sizes, and a boolean 'kept' column. If the
+    limits cannot be met (msg['shortmsg'] says so), no spw is kept.
 
-    # nfields is one MOUS-wide count, applied to every spw (overrides any
-    # nfields the table was built with).
-    table = add_nfields_columns(table, nfields)
+    msg additionally carries 'lever_scores' (the ranking that drove the
+    choice) and, if sum_nchan is given and the MOUS is large, 'warning'.
 
-    # Step 1
-    table = add_size_and_step_columns(
-        table, cube_sizes, product_sizes, limits.maxcubesize
-    )
-    print("-- after Step 1 (per-spw cube mitigation) --")
-    print(
-        table[
-            [
-                "min_steps",
-                "levers_used",
-                "achieved_reduction",
-                "mitigated_cube_GB",
-                "mitigated_product_GB",
-            ]
-        ]
-        .round(3)
-        .to_string()
-    )
-
-    # Step 2a: field reduction
-    kept_fields = None
-    aggregate_for_check = table["mitigated_product_GB"].sum()
-    if nfields > 1:
-        if fields_product_sizes is None or repr_field is None:
-            raise ValueError(
-                "fields_product_sizes and repr_field are required when nfields > 1"
-            )
-        kept_fields, field_total, n_dropped, formula_achieved = step2_field_reduction(
-            fields_product_sizes, repr_field, limits.maxproductsize
-        )
-        print(
-            f"\n-- Step 2a: field reduction -- dropped {n_dropped} field(s) "
-            f"(formula target {formula_achieved:.3f}), kept {kept_fields} "
-            f"(product size {field_total:.2f} GB)"
-        )
-        aggregate_for_check = field_total
-
-        # Fold the outcome into the spw table's own bookkeeping, so
-        # 'nfields' shows up in levers_used/achieved_reduction/min_steps
-        # for every affected spw, exactly like n_bin does when chosen.
-        if n_dropped > 0:
-            table = apply_field_reduction_to_table(table, n_dropped)
-            print(
-                table[
-                    [
-                        "min_steps",
-                        "levers_used",
-                        "achieved_reduction",
-                        "mitigated_cube_GB",
-                        "mitigated_product_GB",
-                    ]
-                ]
-                .round(3)
-                .to_string()
-            )
-        # KNOWN GAP: the spws belonging to dropped fields are not removed
-        # from `table` -- every spw still contributes its (now field-
-        # mitigated) product size below, so Step 2b (if it still runs)
-        # escalates levers across ALL spws, including ones whose field was
-        # just dropped. Fine for exercising the field-count logic in
-        # isolation, but needs the dropped fields' spws excluded from
-        # `table` before this chains correctly with a real multi-field
-        # dataset.
-
-    # Step 2b: global lever escalation, if the aggregate is still over
-    # budget after field reduction (or if there was only one field)
-    if limits.maxproductsize != -1 and aggregate_for_check > limits.maxproductsize:
-        print(
-            f"\n-- Step 2b: global lever escalation -- "
-            f"{aggregate_for_check:.2f} GB > budget {limits.maxproductsize} GB"
-        )
-        table = step2_global_escalation(table, limits.maxproductsize)
-        print(
-            table[
-                [
-                    "min_steps",
-                    "levers_used",
-                    "achieved_reduction",
-                    "mitigated_cube_GB",
-                    "mitigated_product_GB",
-                ]
-            ]
-            .round(3)
-            .to_string()
-        )
-
-    # Step 3
-    selected, msg = step3_select_spws(table, limits, repr_spw)
-    print(f"\n-- Step 3: spw selection -- {msg['shortmsg']}")
-    if selected is None:
-        return None, msg
-    print(
-        selected[
-            [
-                "min_steps",
-                "levers_used",
-                "achieved_reduction",
-                "mitigated_cube_GB",
-                "mitigated_product_GB",
-            ]
-        ]
-        .round(3)
-        .to_string()
-    )
-    print(
-        f"Total selected product size: {selected['mitigated_product_GB'].sum():.2f} GB"
-    )
-
-    # Step 4
+    nfields: number of fields of the MOUS, ONE value for all spws.
+    product_sizes[spw]: product size of that spw summed over all fields."""
+    table, scores = mitigate(table, limits, cube_sizes, product_sizes, nfields)
+    selected, msg = select_spws(table, limits, repr_spw)
+    table["kept"] = table.index.isin(selected.index) if selected is not None else False
+    msg["lever_scores"] = scores
     if sum_nchan is not None:
-        warning = step4_runtime_warning(nfields, sum_nchan)
+        warning = runtime_warning(nfields, sum_nchan)
         if warning:
-            print(f"\n-- Step 4 warning --\n{warning}")
-
-    return selected, msg
+            msg["warning"] = warning
+    return table, msg
 
 
 # =============================================================================
@@ -917,7 +768,7 @@ if __name__ == "__main__":
         f"calculate_sizes: max cube {max_cube:.1f} GB, total product {total_product:.1f} GB"
     )
 
-    selected, msg = plan(
+    final, msg = plan(
         table,
         limits,
         cube_sizes,
@@ -926,3 +777,18 @@ if __name__ == "__main__":
         nfields=1,
         sum_nchan=sum(r["nchan"] for r in example_spws),
     )
+    print("\nLever scores (product-weighted mitigation, best first):")
+    print(msg["lever_scores"].round(3).to_string())
+    print(f"\nResult: {msg['shortmsg']}")
+    print(final.round(3).to_string())
+
+    # Same MOUS observed with 3 fields: each spw's product size now covers
+    # all 3 fields, and nfields competes with the other levers by score.
+    product_sizes_3 = {spw: 3 * size for spw, size in product_sizes.items()}
+    final3, msg3 = plan(
+        table, limits, cube_sizes, product_sizes_3, repr_spw="16 (repr.)", nfields=3
+    )
+    print("\n--- same MOUS with nfields=3 ---")
+    print(msg3["lever_scores"].round(3).to_string())
+    print(f"\nResult: {msg3['shortmsg']}")
+    print(final3.round(3).to_string())
