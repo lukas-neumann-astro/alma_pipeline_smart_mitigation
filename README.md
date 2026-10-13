@@ -130,7 +130,7 @@ The plot notebooks save their figures as PNGs in `70_results/plots/` (`PLOT_DIR`
 
 ## Known simplifications
 
-These are also listed in the module docstring and are worth resolving before this governs real imaging runs:
+These are also listed in the module docstring and are worth resolving before this is implemented into the actual pipeline:
 
 * The PB and cell formulas use a simplified "floor" framing, not the original code's empirical formula, and the carry-over of the converged PB value between steps is not modelled: only *which* levers are used is tracked, not the parameter value each lever converges to. PB, cell and ROI are always applied in full.
 * Levers are assumed to compound independently. `n_bin` and `ROI` both act on the spectral axis, so this may not hold.
