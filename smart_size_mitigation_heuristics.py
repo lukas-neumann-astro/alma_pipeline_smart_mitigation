@@ -65,12 +65,14 @@ summed over all fields; keeping k of N fields scales it by k/N (equal-sized
 fields assumed, the representative field always kept).
 
 KNOWN SIMPLIFICATIONS (worth resolving before this governs real imaging runs):
-  - The PB/cell formulas use a simplified "floor" framing, not the original
-    code's empirical exp() formula, and the original's carry-over of the
-    converged PB value between steps (PB_mitigation = max(PB_mitigation,
-    PB_limit)) is not modelled: only WHICH levers are used per spw is
-    tracked, not the parameter value each lever converges to. PB, cell and
-    ROI are always applied in full (down to the floor / the given ROI).
+  - PB and cell are always applied in full (PB raised to 0.7, cell down to
+    its floor), not to the value the original code's empirical exp() formula
+    would pick, and the original's carry-over of the converged PB value
+    between steps (PB_mitigation = max(PB_mitigation, PB_limit)) is not
+    modelled: only WHICH levers are used per spw is tracked, not the
+    parameter value each lever converges to. ROI is always applied in full
+    too. The original also uses one PB level for all spws; here PB is a
+    per-spw lever.
   - Levers are assumed to compound independently (the size fractions
     multiply); n_bin and ROI both act on the spectral axis, so this may not
     hold.
@@ -198,22 +200,29 @@ def size_fraction_nbin(nchan: int, ratio_satisfied: bool = False) -> float:
     return 1.0 / nbin
 
 
-def size_fraction_pb(pb: float, is_mosaic: bool = False, floor: float = 0.7) -> float:
-    """PB (FoV) lever: the fraction of the size that is left. Not available
-    for mosaics (1.0). For single pointings, tightening PB down to `floor`
-    leaves (floor/pb)^2 of the area (1.0 once pb is at or below the
-    floor)."""
+def size_fraction_pb(pb: float = 0.2, is_mosaic: bool = False, limit: float = 0.7) -> float:
+    """PB (FoV) lever: the fraction of the size that is left. `pb` is the
+    primary beam response at the image edge (hm_imsize='<pb>pb', pipeline
+    default 0.2); mitigation RAISES it up to `limit`, which shrinks the image.
+    Not available for mosaics (1.0).
+
+    For single pointings makeimlist sets the image width to
+    ~ sqrt(-ln(pb) / ln 2) primary beam FWHMs (imageparams_base.imsize()), so
+    the area scales with -ln(pb), and raising pb to `limit` leaves
+    ln(limit) / ln(pb) of the size: 0.22 from the default 0.2 to 0.7.
+    1.0 once pb is at or above the limit."""
     if is_mosaic:
         return 1.0
-    if pb <= floor:
+    if pb >= limit:
         return 1.0
-    return (floor / pb) ** 2
+    return math.log(limit) / math.log(pb)
 
 
-def size_fraction_cell(ppb: float, robust: float | None = None) -> float:
+def size_fraction_cell(ppb: float = 5.0, robust: float | None = None) -> float:
     """Cell size (hm_cell) lever: the fraction of the size that is left.
-    Floor depends on robust: 3.25 ppb for robust=2.0 (PIPE-107), else
-    3.0 ppb. Same area-scaling form as PB."""
+    ppb is the pixels per beam (pipeline default 5). Floor depends on robust:
+    3.25 ppb for robust=2.0 (PIPE-107), else 3.0 ppb. The pixel count of
+    both image axes scales with ppb, so (floor/ppb)^2 of the area is left."""
     floor = 3.25 if robust == 2.0 else 3.0
     if ppb <= floor:
         return 1.0
@@ -240,7 +249,7 @@ def size_fraction_fields(n_fields_total: int, n_fields_kept: int) -> float:
     1 of 5 fields leaves 1/5 = 0.2 of the size.
 
     n_fields_kept must be between 1 (only the representative field
-    survives -- the theoretical floor, same idea as PB/cell's floor) and
+    survives -- the theoretical floor, same idea as the cell floor) and
     n_fields_total (nothing dropped, 1.0)."""
     if n_fields_total <= 0:
         raise ValueError("n_fields_total must be positive")
@@ -439,7 +448,7 @@ def add_nfields_columns(table: pd.DataFrame, nfields: int) -> pd.DataFrame:
         nfields       -- the size fraction that is left when every
                          non-representative field is dropped
                          (n_fields_kept=1), the same way the PB/cell
-                         columns show their floor-capped minimum
+                         columns show the fraction left at their limit
     total_size_fraction is recomputed, since it compounds over
     LEVER_COLUMNS, which includes 'nfields'."""
     if nfields < 1:
@@ -458,6 +467,8 @@ def build_mitigation_table(
     """spw_rows: one dict per spw with keys:
         spw, nchan, ratio_satisfied, pb, is_mosaic, ppb, robust
         and, only if use_roi=True: n_roi, n_total
+    pb (PB response at the image edge) and ppb (pixels per beam) are
+    optional and default to the pipeline defaults, 0.2 and 5.0.
     Returns a DataFrame indexed by spw with one column per lever, holding
     the fraction of the size that is left when the lever is applied in full
     (1 = the lever cannot remove anything), plus a 'total_size_fraction'
@@ -496,8 +507,8 @@ def build_mitigation_table(
                 "n_bin": size_fraction_nbin(
                     row["nchan"], row.get("ratio_satisfied", False)
                 ),
-                "PB": size_fraction_pb(row["pb"], row.get("is_mosaic", False)),
-                "cell": size_fraction_cell(row["ppb"], row.get("robust")),
+                "PB": size_fraction_pb(row.get("pb", 0.2), row.get("is_mosaic", False)),
+                "cell": size_fraction_cell(row.get("ppb", 5.0), row.get("robust")),
                 "ROI": roi_value,
             }
         )
@@ -876,7 +887,7 @@ if __name__ == "__main__":
             "spw": "16 (repr.)",
             "nchan": 3840,
             "ratio_satisfied": False,
-            "pb": 0.9,
+            "pb": 0.2,
             "is_mosaic": False,
             "ppb": 4.0,
             "robust": 2.0,
@@ -885,7 +896,7 @@ if __name__ == "__main__":
             "spw": "18",
             "nchan": 960,
             "ratio_satisfied": True,
-            "pb": 1.0,
+            "pb": 0.2,
             "is_mosaic": False,
             "ppb": 3.5,
             "robust": None,
@@ -894,7 +905,7 @@ if __name__ == "__main__":
             "spw": "20",
             "nchan": 7680,
             "ratio_satisfied": False,
-            "pb": 0.6,
+            "pb": 0.2,
             "is_mosaic": True,
             "ppb": 3.0,
             "robust": None,
@@ -903,7 +914,7 @@ if __name__ == "__main__":
             "spw": "22",
             "nchan": 1920,
             "ratio_satisfied": False,
-            "pb": 0.65,
+            "pb": 0.75,  # already above the 0.7 limit: no PB mitigation
             "is_mosaic": False,
             "ppb": 5.0,
             "robust": 2.0,

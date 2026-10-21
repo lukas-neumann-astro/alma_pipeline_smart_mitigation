@@ -32,8 +32,8 @@ The priorities of the levers are therefore a handful of numbers (`LEVER_WEIGHTS`
 | Lever | Acts on | What it does | Size fraction left |
 |-------|---------|--------------|--------------------|
 | `n_bin` | each cube | Average channels by 2 (only for eligible `nchan`) | `1/nbin` |
-| `PB` | each cube | Tighten the field of view down to a floor of PB = 0.7 (single pointings only, not mosaics) | `(0.7/PB)^2` |
-| `cell` | each cube | Enlarge the cell size down to a floor of 3.25 ppb (robust = 2.0) or 3.0 ppb | `(floor/ppb)^2` |
+| `PB` | each cube | Shrink the field of view by raising the PB response at the image edge (`hm_imsize`, default 0.2) up to a limit of 0.7; nothing to do if PB ≥ 0.7 (single pointings only, not mosaics) | `ln(0.7)/ln(PB)` (0.22 for PB = 0.2) |
+| `cell` | each cube | Enlarge the cell size: pixels per beam (default 5) down to a floor of 3.25 ppb (robust = 2.0) or 3.0 ppb | `(floor/ppb)^2` |
 | `ROI` | each cube | Image only part of the spectral window (optional, not yet in the pipeline; off unless `use_roi=True`) | `n_roi/n_total` |
 | spws | product total | Remove spectral windows (the representative spw is always kept) | share of the product size in the kept spws |
 | fields | product total | Remove fields (the representative field is always kept) | `n_kept/n_total` (equal-sized fields) |
@@ -80,9 +80,9 @@ from smart_size_mitigation_heuristics import Limits, build_mitigation_table, pla
 # One dict per science spw: the inputs of the lever formulas.
 spws = [
     {"spw": "25", "nchan": 3840, "ratio_satisfied": False,
-     "pb": 0.9, "is_mosaic": False, "ppb": 4.0, "robust": 2.0},
+     "pb": 0.2, "is_mosaic": False, "ppb": 5.0, "robust": 2.0},
     {"spw": "27", "nchan": 960, "ratio_satisfied": True,
-     "pb": 1.0, "is_mosaic": False, "ppb": 3.5, "robust": None},
+     "pb": 0.2, "is_mosaic": False, "ppb": 5.0, "robust": None},
 ]
 nchan = {"25": 3840, "27": 960}
 
@@ -132,7 +132,7 @@ The plot notebooks save their figures as PNGs in `70_results/plots/` (`PLOT_DIR`
 
 These are also listed in the module docstring and are worth resolving before this is implemented into the actual pipeline:
 
-* The PB and cell formulas use a simplified "floor" framing, not the original code's empirical formula, and the carry-over of the converged PB value between steps is not modelled: only *which* levers are used is tracked, not the parameter value each lever converges to. PB, cell and ROI are always applied in full.
+* PB, cell and ROI are always applied in full (PB raised to 0.7, cell down to its floor), not to the value the original code's empirical formula would pick, and the carry-over of the converged PB value between steps is not modelled: only *which* levers are used is tracked, not the parameter value each lever converges to. The original uses one PB level for all spws; here PB is a per-spw lever.
 * Levers are assumed to compound independently. `n_bin` and `ROI` both act on the spectral axis, so this may not hold.
 * The size fraction of a cube lever is applied equally to the cube and to the product size (the product also contains the MFS image, which `n_bin` does not affect).
 * The MOUS-level score of `n_bin`, `PB`, `cell` and `ROI` is an unweighted mean over the kept spws.
